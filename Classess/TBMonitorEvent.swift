@@ -150,8 +150,28 @@ struct TDEvent {
         body["id"] = id
         body["ts"] = TDISO8601.string(from: ts)
         body["kind"] = kind
-        for (key, value) in fields { body[key] = value }
+        for (key, value) in fields {
+            body[key] = TDEvent.clamp(value, key: key)
+        }
         if !attributes.isEmpty { body["attributes"] = attributes }
         return body
+    }
+
+    /// 按服务端 schema 的字段上限截断。超限会让整批被拒，损失面远大于截断。
+    private static func clamp(_ value: Any, key: String) -> Any {
+        guard let text = value as? String else { return value }
+        let limit: Int
+        switch key {
+        case "message": limit = 4_000          // schema: 4096
+        case "stack": limit = 60_000           // schema: 65536
+        case "url": limit = 2_000              // schema: 2048
+        case "exceptionType": limit = 120      // schema: 128
+        case "exceptionCodes": limit = 500     // schema: 512
+        case "signal": limit = 60              // schema: 64
+        case "screen": limit = 250             // schema: 256
+        default: limit = 512
+        }
+        guard text.count > limit else { return text }
+        return String(text.prefix(limit))
     }
 }

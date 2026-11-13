@@ -11,9 +11,11 @@ import MetricKit
 final class TDMetricKitBridge: NSObject, MXMetricManagerSubscriber {
 
     private let transport: TDTransport
+    private let exitDiagnostics: TDExitDiagnostics?
 
-    init(transport: TDTransport) {
+    init(transport: TDTransport, exitDiagnostics: TDExitDiagnostics? = nil) {
         self.transport = transport
+        self.exitDiagnostics = exitDiagnostics
         super.init()
         MXMetricManager.shared.add(self)
     }
@@ -75,6 +77,10 @@ final class TDMetricKitBridge: NSObject, MXMetricManagerSubscriber {
 
     func didReceive(_ payloads: [MXMetricPayload]) {
         for payload in payloads {
+            // OOM / 看门狗终止的权威来源：累计退出原因计数，只上报增量。
+            if let exit = payload.applicationExitMetrics {
+                exitDiagnostics?.handle(exit)
+            }
             if let memory = payload.memoryMetrics?.peakMemoryUsage {
                 transport.enqueue(TDEvent(
                     kind: "mobile_metric",
