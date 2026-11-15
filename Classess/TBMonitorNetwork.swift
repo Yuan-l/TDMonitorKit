@@ -4,23 +4,42 @@ import UIKit
 #endif
 
 /// 一次请求的可观测结果。
-struct TDNetworkSample {
-    let url: String
-    let method: String
-    let status: Int
-    let durationMs: Double
-    let dnsMs: Double?
-    let tcpMs: Double?
-    let tlsMs: Double?
-    let ttfbMs: Double?
-    let requestBytes: Int64?
-    let responseBytes: Int64?
-    let errorDomain: String?
-    let errorCode: Int?
-    let protocolName: String?
-    let reusedConnection: Bool
-    let transactionCount: Int
-    let cached: Bool
+public struct TDNetworkSample {
+    public let url: String
+    public let method: String
+    public let status: Int
+    public let durationMs: Double
+    public let dnsMs: Double?
+    public let tcpMs: Double?
+    public let tlsMs: Double?
+    public let ttfbMs: Double?
+    public let requestBytes: Int64?
+    public let responseBytes: Int64?
+    public let errorDomain: String?
+    public let errorCode: Int?
+    public let protocolName: String?
+    public let reusedConnection: Bool
+    public let transactionCount: Int
+    public let cached: Bool
+
+    // 以下字段只有统一网络层（`TDURLSessionNetworkClient`）路径才有值。
+    // legacy swizzle 拿不到业务语义，保持默认值即可——**用默认值而不是
+    // 猜测一个值**，否则后端无法区分「这条请求确实没有接口名」和
+    // 「采集不到接口名」。
+
+    /// 归一化接口名，供后端按接口聚合。
+    var endpoint: String? = nil
+    /// 与 breadcrumb / 崩溃串联的链路 ID。
+    var traceId: String? = nil
+    /// 第几次尝试（0 表示首次）。用于算重试率。
+    var attempt: Int = 0
+    /// 上报自身的流量。这类样本不进业务网络质量统计。
+    var isInternal: Bool = false
+    /// 分段耗时是否缺失。`true` 时后端应把该样本排除在分阶段报表之外，
+    /// 但仍可计入成功率。
+    var metricsMissing: Bool = false
+    /// 被拦截器短路的原因（缓存命中 / 前置条件失败 / 取消）。
+    var shortCircuit: String? = nil
 }
 
 /// 关联对象 key。放文件级变量，避免静态存储属性在严格并发检查下的告警。
@@ -59,12 +78,14 @@ final class TDNetworkInstrumentation {
 
     func install(ingestURL: URL, handler: @escaping (TDNetworkSample) -> Void) {
         lock.lock()
-        if installed { lock.unlock(); return }
+        let needsSwizzle = !installed
         installed = true
         self.handler = handler
         self.ingestHost = ingestURL.host
         self.ingestPathFragment = ingestURL.path
         lock.unlock()
+
+        guard needsSwizzle else { return }
 
         let legacy = installLegacySessionHook()
         let callbacks = installCompletionHandlerHooks()
@@ -74,11 +95,24 @@ final class TDNetworkInstrumentation {
             level: legacy ? "info" : "warning")
     }
 
-    /// 供未走到 `install` 的极早期调用方使用（例如启动前建的 session）。
+    /// 停止投递。
+    ///
+    /// 已经交换的方法实现**不撤销**：交换是全局的，撤销瞬间可能仍有
+    /// 正在飞行的 task 持有旧 IMP，反而更容易崩。这里只切断 handler，
+    /// 让钩子变成空转。要彻底还原需要进程重启——业界带 swizzle 的 SDK
+    /// 普遍是这个取舍，与其假装能干净卸载，不如把边界说清楚。
+    func uninstall() {
+        lock.lock()
+        handler = nil
+        lock.unlock()
+        TDMonitorLog.record("网络埋点已停止投递（方法交换保留，重启后不再安装）", level: "info")
+    }
+
+    /// 供所有采集路径（统一网络层 / legacy swizzle / 完成回调拦截）投递样本。
     ///
     /// 同一次请求可能走两条路径（delegate metrics + 完成回调），必须只上报一条：
     /// 否则 api 成功率、p95 全部会被放大两倍。先在 task 上打标记，后到的那条丢弃。
-    fileprivate func emit(_ sample: TDNetworkSample, task: URLSessionTask? = nil) {
+    func emit(_ sample: TDNetworkSample, task: URLSessionTask? = nil) {
         if let task = task {
             objc_sync_enter(task)
             let alreadyReported = objc_getAssociatedObject(task, &tdReportedKey) != nil
@@ -94,7 +128,13 @@ final class TDNetworkInstrumentation {
         let path = self.ingestPathFragment
         lock.unlock()
         guard let handler = handler else { return }
-        if let host = host, let path = path,
+        // 统一网络层路径带显式标记，优先用它——这是可靠的那条。
+        if sample.isInternal { return }
+        // legacy swizzle 没有业务语义可标，只能退回 URL 匹配。
+        // 这条兜底必须留着（老路径无法改造），但可靠性有限：
+        // 后端换域名、加 CDN、改路径前缀都会静默失效。
+        // 所以只在「拿不到 endpoint」时启用，避免误杀正常业务请求。
+        if sample.endpoint == nil, let host = host, let path = path,
            sample.url.contains(host), sample.url.contains(path) {
             return   // 监控自身的上报请求不计入业务网络质量
         }
@@ -262,52 +302,23 @@ final class TDURLSessionDelegateProxy: NSObject, URLSessionDelegate, URLSessionT
         TDNetworkInstrumentation.shared.emit(sample, task: task)
     }
 
+    /// metrics → 样本。委托给 `TDNetworkMetricsMapper`，
+    /// 与统一网络层路径共用同一份折算式——两份实现必然会出现口径漂移，
+    /// 而分阶段报表最怕的就是「同一条请求在两条路径上算法不同」。
     static func makeSample(task: URLSessionTask, metrics: URLSessionTaskMetrics) -> TDNetworkSample? {
         guard let request = task.originalRequest ?? task.currentRequest,
               let url = request.url?.absoluteString else { return nil }
 
-        let transactions = metrics.transactionMetrics
-        var dnsMs: Double = 0
-        var tcpMs: Double = 0
-        var tlsMs: Double = 0
-        var ttfbMs: Double = 0
-        var sawDNS = false, sawTCP = false, sawTLS = false, sawTTFB = false
-
-        for transaction in transactions {
-            if let start = transaction.domainLookupStartDate, let end = transaction.domainLookupEndDate {
-                dnsMs += end.timeIntervalSince(start) * 1000; sawDNS = true
-            }
-            if let start = transaction.connectStartDate, let end = transaction.connectEndDate {
-                tcpMs += end.timeIntervalSince(start) * 1000; sawTCP = true
-            }
-            if let start = transaction.secureConnectionStartDate, let end = transaction.secureConnectionEndDate {
-                tlsMs += end.timeIntervalSince(start) * 1000; sawTLS = true
-            }
-            if let start = transaction.requestStartDate, let end = transaction.responseStartDate {
-                ttfbMs = end.timeIntervalSince(start) * 1000; sawTTFB = true   // 只取最后一段
-            }
-        }
-
-        let last = transactions.last
         let nsError = task.error as NSError?
-        return TDNetworkSample(
+        return TDNetworkMetricsMapper.makeSample(
             url: url,
             method: request.httpMethod ?? "GET",
             status: (task.response as? HTTPURLResponse)?.statusCode ?? 0,
-            durationMs: metrics.taskInterval.duration * 1000,
-            dnsMs: sawDNS ? dnsMs : nil,
-            tcpMs: sawTCP ? tcpMs : nil,
-            tlsMs: sawTLS ? tlsMs : nil,
-            ttfbMs: sawTTFB ? ttfbMs : nil,
-            requestBytes: Int64(request.httpBody?.count ?? 0),
-            responseBytes: last?.countOfResponseBodyBytesReceived,
             errorDomain: nsError?.domain,
             errorCode: nsError?.code,
-            protocolName: last?.networkProtocolName,
-            reusedConnection: last?.isReusedConnection ?? false,
-            transactionCount: transactions.count,
-            cached: last?.resourceFetchType == .localCache
-        )
+            metrics: metrics,
+            requestBytes: Int64(request.httpBody?.count ?? 0),
+            responseBytes: metrics.transactionMetrics.last?.countOfResponseBodyBytesReceived)
     }
 }
 

@@ -10,21 +10,33 @@ import MetricKit
 @available(iOS 14.0, *)
 final class TDMetricKitBridge: NSObject, MXMetricManagerSubscriber {
 
-    private let transport: TDTransport
+    private let sink: TDEventSink
     private let exitDiagnostics: TDExitDiagnostics?
+    private var subscribed = true
 
-    init(transport: TDTransport, exitDiagnostics: TDExitDiagnostics? = nil) {
-        self.transport = transport
+    init(sink: TDEventSink, exitDiagnostics: TDExitDiagnostics? = nil) {
+        self.sink = sink
         self.exitDiagnostics = exitDiagnostics
         super.init()
         MXMetricManager.shared.add(self)
     }
 
-    deinit { MXMetricManager.shared.remove(self) }
+    /// 取消订阅。MetricKit 的订阅是强引用，不显式摘掉会在 SDK 停止后
+    /// 继续往里投递 payload。
+    func stop() {
+        guard subscribed else { return }
+        subscribed = false
+        MXMetricManager.shared.remove(self)
+    }
+
+    deinit { if subscribed { MXMetricManager.shared.remove(self) } }
 
     // MARK: - Diagnostics (daily, iOS 14+)
 
     func didReceive(_ payloads: [MXDiagnosticPayload]) {
+        // 记录真实投递：用户关闭「共享 iPhone 分析」后这里永远不会被调用，
+        // 计数为 0 的设备就是无覆盖设备，见 TDMetricKitCoverage。
+        if !payloads.isEmpty { TDMetricKitCoverage.recordDelivery() }
         for payload in payloads {
             for crash in payload.crashDiagnostics ?? [] {
                 var fields: [String: Any] = [
@@ -35,72 +47,73 @@ final class TDMetricKitBridge: NSObject, MXMetricManagerSubscriber {
                 if let signal = crash.signal?.stringValue { fields["signal"] = signal }
                 if let exceptionType = crash.exceptionType?.stringValue { fields["exceptionType"] = exceptionType }
                 if let exceptionCodes = crash.exceptionCode?.stringValue { fields["exceptionCodes"] = exceptionCodes }
-                transport.enqueue(TDEvent(
+                sink.enqueue(TDEvent(
                     kind: "native_crash",
                     fields: fields,
-                    attributes: ["source": "MetricKit", "applicationVersion": crash.applicationVersion]
+                    attributes: ["source": "metrickit", "applicationVersion": crash.applicationVersion]
                 ))
             }
 
             for hang in payload.hangDiagnostics ?? [] {
                 let ms = hang.hangDuration.converted(to: .milliseconds).value
-                transport.enqueue(TDEvent(
+                sink.enqueue(TDEvent(
                     kind: "anr",
                     fields: ["durationMs": ms, "type": "watchdog"],
-                    attributes: ["source": "MetricKit", "applicationVersion": hang.applicationVersion]
+                    attributes: ["source": "metrickit", "applicationVersion": hang.applicationVersion]
                 ))
             }
 
             for exception in payload.cpuExceptionDiagnostics ?? [] {
-                transport.enqueue(TDEvent(
+                sink.enqueue(TDEvent(
                     kind: "mobile_metric",
                     fields: ["name": "cpu", "value": exception.totalCPUTime.converted(to: .seconds).value,
                              "unit": "s", "severity": "warning"],
-                    attributes: ["source": "MetricKit", "reason": "cpu_exception",
+                    attributes: ["source": "metrickit", "reason": "cpu_exception",
                                  "stack": Self.stackString(exception.callStackTree)]
                 ))
             }
 
             for exception in payload.diskWriteExceptionDiagnostics ?? [] {
-                transport.enqueue(TDEvent(
+                sink.enqueue(TDEvent(
                     kind: "mobile_metric",
                     fields: ["name": "disk", "value": exception.totalWritesCaused.converted(to: .megabytes).value,
                              "unit": "MB", "severity": "warning"],
-                    attributes: ["source": "MetricKit", "reason": "excessive_disk_writes"]
+                    attributes: ["source": "metrickit", "reason": "excessive_disk_writes"]
                 ))
             }
         }
-        transport.flush()
+        sink.flush()
     }
 
     // MARK: - Aggregate metrics (daily, iOS 13+)
 
     func didReceive(_ payloads: [MXMetricPayload]) {
+        if !payloads.isEmpty { TDMetricKitCoverage.recordDelivery() }
         for payload in payloads {
             // OOM / 看门狗终止的权威来源：累计退出原因计数，只上报增量。
             if let exit = payload.applicationExitMetrics {
                 exitDiagnostics?.handle(exit)
             }
             if let memory = payload.memoryMetrics?.peakMemoryUsage {
-                transport.enqueue(TDEvent(
+                sink.enqueue(TDEvent(
                     kind: "mobile_metric",
                     fields: ["name": "memory", "value": memory.converted(to: .megabytes).value, "unit": "MB"],
-                    attributes: ["source": "MetricKit", "metric": "peakMemoryUsage",
+                    attributes: ["source": "metrickit", "metric": "peakMemoryUsage",
                                  "appVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"]
                 ))
             }
             if let cpu = payload.cpuMetrics?.cumulativeCPUTime {
-                transport.enqueue(TDEvent(
+                sink.enqueue(TDEvent(
                     kind: "mobile_metric",
                     fields: ["name": "cpu", "value": cpu.converted(to: .seconds).value, "unit": "s"],
-                    attributes: ["source": "MetricKit", "metric": "cumulativeCPUTime"]
+                    attributes: ["source": "metrickit", "metric": "cumulativeCPUTime"]
                 ))
             }
             // Cold/warm launch is measured directly at runtime in TDMonitor.recordLaunch();
             // MXAppLaunchMetric only exposes a histogram without an average accessor, so
             // mixing it in here would double-count and distort the P95.
         }
-        transport.flush()
+        sink.flush()
     }
 
     // MARK: - Helpers

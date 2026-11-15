@@ -8,14 +8,14 @@ import MachO
 ///
 /// 符号化的前提是「崩溃栈里的地址」与「dSYM 的 UUID」能对上，否则 dSYM 一换
 /// 版本就全错。这里直接从 Mach-O 的 LC_UUID 读取，不依赖任何私有接口。
-enum TDBinaryImage {
+public enum TDBinaryImage {
 
-    static func uuid(forImageAt index: UInt32 = 0) -> String? {
+    public static func uuid(forImageAt index: UInt32 = 0) -> String? {
         guard let header = _dyld_get_image_header(index) else { return nil }
         return uuid(in: header)
     }
 
-    static func uuid(in header: UnsafePointer<mach_header>) -> String? {
+    public static func uuid(in header: UnsafePointer<mach_header>) -> String? {
         let is64 = header.pointee.magic == MH_MAGIC_64 || header.pointee.magic == MH_CIGAM_64
         let headerSize = is64 ? MemoryLayout<mach_header_64>.size : MemoryLayout<mach_header>.size
         var cursor = UnsafeRawPointer(header).advanced(by: headerSize)
@@ -36,11 +36,11 @@ enum TDBinaryImage {
         return nil
     }
 
-    static var mainUUID: String? { uuid() }
+    public static var mainUUID: String? { uuid() }
 
     /// 主二进制在**本次运行**中的加载基址。
     /// PIE 每次启动的 slide 不同，只有把基址一起上报，事后才能用 atos + dSYM 还原行号。
-    static var mainLoadAddress: UInt64? {
+    public static var mainLoadAddress: UInt64? {
         guard let header = _dyld_get_image_header(0) else { return nil }
         return UInt64(UInt(bitPattern: header))
     }
@@ -51,7 +51,7 @@ enum TDBinaryImage {
 /// 早期实现把面包屑只放在内存里，App 被杀时一起消失；崩溃是「下一次启动」
 /// 才补发的，那时内存早已清空，所以崩溃事件里的 `breadcrumbs` 永远是空数组。
 /// 现在每条面包屑都会落盘（节流写入），崩溃补发时能带上真实的操作轨迹。
-final class TDBreadcrumbStore {
+public final class TDBreadcrumbStore {
 
     private let maxCount = 100
     private let lock = NSLock()
@@ -67,7 +67,7 @@ final class TDBreadcrumbStore {
             .appendingPathComponent("breadcrumbs.json")
     }
 
-    func append(category: String, message: String, level: String) {
+    public func append(category: String, message: String, level: String) {
         let crumb: [String: Any] = [
             "ts": TDISO8601.string(from: Date()),
             "category": String(category.prefix(64)),
@@ -87,7 +87,7 @@ final class TDBreadcrumbStore {
     }
 
     /// 进入后台 / 崩溃前调用，把节流期间攒下的内容立即刷盘。
-    func flush() {
+    public func flush() {
         lock.lock()
         let snapshot = items
         let needsWrite = dirty
@@ -97,13 +97,13 @@ final class TDBreadcrumbStore {
         if needsWrite { write(snapshot) }
     }
 
-    func current() -> [[String: Any]] {
+    public func current() -> [[String: Any]] {
         lock.lock(); defer { lock.unlock() }
         return items
     }
 
     /// 上次会话残留的面包屑，用于给「上次崩溃」补齐轨迹。
-    func loadPreviousSession() -> [[String: Any]] {
+    public func loadPreviousSession() -> [[String: Any]] {
         guard let data = try? Data(contentsOf: fileURL),
               let stored = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
         return stored.suffix(maxCount).compactMap { raw in

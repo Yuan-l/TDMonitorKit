@@ -12,6 +12,14 @@ public struct TDMonitorConfiguration {
     public let maxQueueSize: Int
     public let flushInterval: TimeInterval
     public let hangThresholdMs: Double
+    /// 卡顿**上报**阈值。`hangThresholdMs` 只是开始采样的起点，
+    /// 真正决定「算不算一次卡顿」的是这个值。默认 2000ms，与 Sentry
+    /// `defaultAppHangTimeoutInterval` 一致。
+    ///
+    /// 为什么必须和采样起点分开：250ms 级的抖动在启动、页面切换时极常见，
+    /// 如果逐条上报，真实卡顿会被自己制造的噪声淹掉；但如果等到 2s 才开始
+    /// 采栈，早期调用链已经拿不到了。所以「早点采、晚点报」。
+    public let anrReportThresholdMs: Double
     public let anrSampleIntervalMs: Double
     public let maxHangMs: Double
     public let longTaskThresholdMs: Double
@@ -20,6 +28,9 @@ public struct TDMonitorConfiguration {
     public let networkInstrumentation: Bool
     public let viewLoadInstrumentation: Bool
     public let nonFatalCapture: Bool
+    /// 页面渲染质量的切片窗口。停留超过该时长就结算一片上报，
+    /// 保证用户一直停在同一个页面时也有数据。
+    public let screenSliceSeconds: TimeInterval
 
     public init(
         baseURL: URL,
@@ -31,6 +42,7 @@ public struct TDMonitorConfiguration {
         maxQueueSize: Int = 1000,
         flushInterval: TimeInterval = 10,
         hangThresholdMs: Double = 250,
+        anrReportThresholdMs: Double = 2_000,
         anrSampleIntervalMs: Double = 50,
         maxHangMs: Double = 10_000,
         longTaskThresholdMs: Double = 100,
@@ -38,7 +50,8 @@ public struct TDMonitorConfiguration {
         autoCollect: Bool = true,
         networkInstrumentation: Bool = true,
         viewLoadInstrumentation: Bool = true,
-        nonFatalCapture: Bool = true
+        nonFatalCapture: Bool = true,
+        screenSliceSeconds: TimeInterval = 30
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
@@ -51,6 +64,8 @@ public struct TDMonitorConfiguration {
         self.maxQueueSize = max(100, maxQueueSize)
         self.flushInterval = max(2, flushInterval)
         self.hangThresholdMs = max(50, hangThresholdMs)
+        // 上报阈值不能低于采样起点，否则"还没开始采样就已经要上报"。
+        self.anrReportThresholdMs = max(self.hangThresholdMs, anrReportThresholdMs)
         self.anrSampleIntervalMs = max(20, anrSampleIntervalMs)
         self.maxHangMs = max(1000, maxHangMs)
         self.longTaskThresholdMs = max(16, longTaskThresholdMs)
@@ -59,6 +74,7 @@ public struct TDMonitorConfiguration {
         self.networkInstrumentation = networkInstrumentation
         self.viewLoadInstrumentation = viewLoadInstrumentation
         self.nonFatalCapture = nonFatalCapture
+        self.screenSliceSeconds = max(5, screenSliceSeconds)
     }
 
     /// 兼容主机根（`http://host:3000`）与 API 根（`http://host:3000/api/v1`），
@@ -105,6 +121,7 @@ public struct TDMonitorConfiguration {
             maxQueueSize: intValue(dict["maxQueueSize"]) ?? 1000,
             flushInterval: doubleValue(dict["flushInterval"]) ?? 10,
             hangThresholdMs: doubleValue(dict["hangThresholdMs"]) ?? 250,
+            anrReportThresholdMs: doubleValue(dict["anrReportThresholdMs"]) ?? 2_000,
             anrSampleIntervalMs: doubleValue(dict["anrSampleIntervalMs"]) ?? 50,
             maxHangMs: doubleValue(dict["maxHangMs"]) ?? 10_000,
             longTaskThresholdMs: doubleValue(dict["longTaskThresholdMs"]) ?? 100,
@@ -112,7 +129,8 @@ public struct TDMonitorConfiguration {
             autoCollect: dict["autoCollect"] as? Bool ?? true,
             networkInstrumentation: dict["networkInstrumentation"] as? Bool ?? true,
             viewLoadInstrumentation: dict["viewLoadInstrumentation"] as? Bool ?? true,
-            nonFatalCapture: dict["nonFatalCapture"] as? Bool ?? true
+            nonFatalCapture: dict["nonFatalCapture"] as? Bool ?? true,
+            screenSliceSeconds: doubleValue(dict["screenSliceSeconds"]) ?? 30
         )
     }
 

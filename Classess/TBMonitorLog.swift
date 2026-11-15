@@ -17,6 +17,9 @@ enum TDMonitorLog {
     private static var entries: [String] = []
     private static var fileBuffer: String?
     private static var lastWrite = Date.distantPast
+    private static let flushQueue = DispatchQueue(label: "com.tdmonitor.log.flush")
+    /// 节流窗口的兜底刷新任务；同一时刻最多挂一个。只在 lock 内读写。
+    private static var pendingFlush: DispatchWorkItem?
 
     static var fileURL: URL {
         let base = (try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
@@ -69,8 +72,23 @@ enum TDMonitorLog {
             buffer = keep
         }
         fileBuffer = buffer
-        guard Date().timeIntervalSince(lastWrite) > writeInterval else { return }
+        guard Date().timeIntervalSince(lastWrite) > writeInterval else {
+            scheduleFlushLocked()
+            return
+        }
         writeLocked()
+    }
+
+    /// 节流窗口内的日志只留在 `fileBuffer`。若不安排一次兜底落盘，
+    /// 「启动 / 队列淘汰 / 崩溃前」这类短时爆发之后进程被强杀，warning 会连同
+    /// buffer 一起消失——恰好是最需要留痕的几行，而且爆发后往往就没有下一条日志
+    /// 来触发写盘了。窗口结束时无条件刷一次；退后台的 `flushToDisk()` 仍保留。
+    /// 调用方持有 lock。
+    private static func scheduleFlushLocked() {
+        guard pendingFlush == nil else { return }
+        let item = DispatchWorkItem { TDMonitorLog.flushToDisk() }
+        pendingFlush = item
+        flushQueue.asyncAfter(deadline: .now() + writeInterval, execute: item)
     }
 
     private static func writeLocked() {
@@ -81,5 +99,7 @@ enum TDMonitorLog {
         // 原子写：任何时刻被强杀都不会留下半截文件。
         try? Data(buffer.utf8).write(to: url, options: .atomic)
         lastWrite = Date()
+        pendingFlush?.cancel()
+        pendingFlush = nil
     }
 }

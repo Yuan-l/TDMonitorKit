@@ -37,6 +37,21 @@ final class TDNonFatalRecorder {
         method_exchangeImplementations(originalMethod, replacementMethod)
     }
 
+    /// 还原 `-[NSException raise]` 并停止投递。
+    func uninstall() {
+        lock.lock()
+        handler = nil
+        let wasInstalled = installed
+        installed = false
+        lock.unlock()
+        guard wasInstalled else { return }
+        let original = #selector(NSException.raise)
+        let replacement = #selector(NSException.td_raise)
+        guard let originalMethod = class_getInstanceMethod(NSException.self, original),
+              let replacementMethod = class_getInstanceMethod(NSException.self, replacement) else { return }
+        method_exchangeImplementations(originalMethod, replacementMethod)
+    }
+
     /// 业务侧显式上报（Swift `Error`、被 catch 的异常、降级分支）。
     func record(message: String, stack: String? = nil, category: String = "non_fatal",
                 attributes: [String: Any] = [:]) {

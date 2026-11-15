@@ -12,15 +12,15 @@ import Darwin
 /// - 磁盘：`attributesOfFileSystem`
 /// - 线程：`task_threads` 计数
 /// - FD：`/dev/fd` 目录项计数
-enum TDResourceSampler {
+public enum TDResourceSampler {
 
-    struct Memory {
-        let footprintMb: Double
-        let availableMb: Double?
-        let limitMb: Double?
+    public struct Memory {
+        public let footprintMb: Double
+        public let availableMb: Double?
+        public let limitMb: Double?
     }
 
-    static func memory() -> Memory? {
+    public static func memory() -> Memory? {
         #if canImport(Darwin)
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
@@ -47,7 +47,7 @@ enum TDResourceSampler {
     private static let cpuLock = NSLock()
     private static var lastCPU: (seconds: Double, wall: TimeInterval)?
 
-    static func cpuPercent() -> Double? {
+    public static func cpuPercent() -> Double? {
         #if canImport(Darwin)
         var info = task_basic_info()
         var count = mach_msg_type_number_t(MemoryLayout<task_basic_info>.size / MemoryLayout<integer_t>.size)
@@ -76,7 +76,7 @@ enum TDResourceSampler {
         return max(0, min(ceiling, ((seconds - last.seconds) / elapsed) * 100))
     }
 
-    static func disk() -> (freeMb: Double, totalMb: Double)? {
+    public static func disk() -> (freeMb: Double, totalMb: Double)? {
         let path = NSHomeDirectory()
         guard let attributes = try? FileManager.default.attributesOfFileSystem(forPath: path),
               let free = attributes[.systemFreeSize] as? NSNumber,
@@ -84,7 +84,7 @@ enum TDResourceSampler {
         return (Double(free.int64Value) / 1_048_576.0, Double(total.int64Value) / 1_048_576.0)
     }
 
-    static func threadCount() -> Int? {
+    public static func threadCount() -> Int? {
         #if canImport(Darwin)
         var threads: thread_act_array_t?
         var count: mach_msg_type_number_t = 0
@@ -100,7 +100,7 @@ enum TDResourceSampler {
         #endif
     }
 
-    static func fileDescriptorCount() -> Int? {
+    public static func fileDescriptorCount() -> Int? {
         #if canImport(Darwin)
         // 两条常见做法在 iOS 上都不成立：`/dev/fd` 在沙箱里不可枚举（contentsOfDirectory
         // 直接返回 nil），`proc_pidinfo` 没有导出到 Swift 模块。改成逐个问内核
@@ -116,74 +116,37 @@ enum TDResourceSampler {
     }
 }
 
-/// 上次会话终止前的内存快照。
-///
-/// 真机 OOM 是系统直接杀进程，客户端没有机会上报任何东西。唯一可行的是
-/// 在进入后台 / 收到内存警告时落盘一次现场，下次启动若判定为异常退出，
-/// 就把这份快照作为归因证据（内存已逼近上限 vs 与内存无关）。
-struct TDTerminationSnapshot {
-    var footprintMb: Double?
-    var availableMb: Double?
-    var limitMb: Double?
-    var foreground: Bool
-    var at: Date?
+/// 说明：原先这里有一个只存单点快照的 `TDTerminationSnapshot`（覆盖写
+/// `last_session.json`）。它有两个致命缺陷，已被 `TDAppState` 取代：
+/// 1. 用 `UserDefaults` 存「本次是否干净退出」，SIGKILL 前不保证落盘；
+/// 2. 只留最后一个内存采样点，SIGKILL 类退出没有崩溃栈，唯一证据就是死亡前
+///    的内存爬升曲线，单点等于没有证据。
+/// 现由 `TDAppStateTracker`（`TBMonitorTermination.swift`）维护完整现场。
 
-    private static var fileURL: URL {
-        let base = (try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
-                                                 appropriateFor: nil, create: true))
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        return base.appendingPathComponent("TDMonitor", isDirectory: true)
-            .appendingPathComponent("last_session.json")
-    }
-
-    func write() {
-        var payload: [String: Any] = [
-            "foreground": foreground,
-            "ts": TDISO8601.string(from: Date()),
-        ]
-        if let footprintMb = footprintMb { payload["footprintMb"] = footprintMb }
-        if let availableMb = availableMb { payload["availableMb"] = availableMb }
-        if let limitMb = limitMb { payload["limitMb"] = limitMb }
-        let url = TDTerminationSnapshot.fileURL
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
-                                                 withIntermediateDirectories: true)
-        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
-        try? data.write(to: url, options: .atomic)
-    }
-
-    static func read() -> TDTerminationSnapshot? {
-        guard let data = try? Data(contentsOf: fileURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return TDTerminationSnapshot(
-            footprintMb: json["footprintMb"] as? Double,
-            availableMb: json["availableMb"] as? Double,
-            limitMb: json["limitMb"] as? Double,
-            foreground: json["foreground"] as? Bool ?? true,
-            at: (json["ts"] as? String).flatMap { formatter.date(from: $0) }
-        )
-    }
-
-    static func clear() { try? FileManager.default.removeItem(at: fileURL) }
-}
-
-/// 定时资源采集 + 前台/后台内存快照。
+/// 定时资源采集 + 内存序列落盘。
 final class TDResourceMonitor {
 
     private let config: TDMonitorConfiguration
-    private weak var transport: TDTransport?
-    private let queue = DispatchQueue(label: "com.truedepth.monitor.resource", qos: .utility)
+    private weak var sink: TDEventSink?
+    /// 终止归因的现场记录器。注入而不是直接摸 `.shared`，
+    /// 否则这一层永远无法在测试里替换掉真实落盘。
+    private let appState: TDAppStateTracker
+    private let queue = TDMonitorQueues.resource
     private var timer: DispatchSourceTimer?
+    /// 内存单独高频采样。OOM 前兆的爬升曲线需要 5s 级分辨率，
+    /// 而 CPU / 磁盘 / 电池这类指标 30s 一次足够——混在一个 timer 里
+    /// 要么内存太稀、要么其他指标白烧电。
+    private var memoryTimer: DispatchSourceTimer?
     private var peakMb: Double = 0
     private var lastReportedPeak: Double = 0
     private var isForeground = true
 
     var onMemoryWarning: (() -> Void)?
 
-    init(config: TDMonitorConfiguration, transport: TDTransport) {
+    init(config: TDMonitorConfiguration, sink: TDEventSink, appState: TDAppStateTracker = .shared) {
         self.config = config
-        self.transport = transport
+        self.sink = sink
+        self.appState = appState
     }
 
     func start() {
@@ -198,31 +161,45 @@ final class TDResourceMonitor {
         timer.setEventHandler { [weak self] in self?.sample() }
         timer.resume()
         self.timer = timer
+
+        // 内存单独 5s 一次：只服务于终止归因的爬升曲线，不产生上报事件
+        // （上报仍走 30s 的 sample，避免把事件量放大 6 倍）。
+        let memoryTimer = DispatchSource.makeTimerSource(queue: queue)
+        memoryTimer.schedule(deadline: .now() + 1, repeating: 5)
+        memoryTimer.setEventHandler { [weak self] in self?.traceMemory() }
+        memoryTimer.resume()
+        self.memoryTimer = memoryTimer
     }
 
     func stop() {
         timer?.cancel()
         timer = nil
+        memoryTimer?.cancel()
+        memoryTimer = nil
         NotificationCenter.default.removeObserver(self)
     }
 
     func setForeground(_ foreground: Bool) {
         isForeground = foreground
-        snapshot()
+        appState.setForeground(foreground)
+        traceMemory()
     }
 
-    /// 落盘一次现场，供下次启动归因 OOM。
-    func snapshot() {
+    /// 高频内存追踪：只写本地现场，不发网络事件。
+    private func traceMemory() {
         guard let memory = TDResourceSampler.memory() else { return }
-        TDTerminationSnapshot(footprintMb: memory.footprintMb,
-                              availableMb: memory.availableMb,
+        appState.recordMemory(footprintMb: memory.footprintMb,
                               limitMb: memory.limitMb,
-                              foreground: isForeground).write()
+                              availableMb: memory.availableMb)
     }
+
+    /// 兼容旧调用点：立即刷新一次现场。
+    func snapshot() { traceMemory() }
 
     @objc private func didReceiveMemoryWarning() {
         onMemoryWarning?()
-        snapshot()
+        appState.recordMemoryWarning()
+        traceMemory()
         guard let memory = TDResourceSampler.memory() else { return }
         enqueue(name: "memory", value: memory.footprintMb, unit: "MB", severity: "warning",
                 attributes: ["memoryWarning": true,
@@ -298,6 +275,6 @@ final class TDResourceMonitor {
         var fields: [String: Any] = ["name": name, "value": value]
         if let unit = unit { fields["unit"] = unit }
         if let severity = severity { fields["severity"] = severity }
-        transport?.enqueue(TDEvent(kind: "mobile_metric", fields: fields, attributes: attributes))
+        sink?.enqueue(TDEvent(kind: "mobile_metric", fields: fields, attributes: attributes))
     }
 }

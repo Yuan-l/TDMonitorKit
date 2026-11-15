@@ -17,32 +17,32 @@ enum TDISO8601 {
 }
 
 /// Immutable-by-default session dimensions, with thread-safe mutable dimensions.
-final class TDContext {
-    let appId: String
-    let environment: String
-    let release: String
-    let os: String = "ios"
-    let osVersion: String
-    let deviceModel: String
-    let appVersion: String
-    let buildNumber: String
-    let deviceId: String
-    let sessionId: String
+public final class TDContext {
+    public let appId: String
+    public let environment: String
+    public let release: String
+    public let os: String = "ios"
+    public let osVersion: String
+    public let deviceModel: String
+    public let appVersion: String
+    public let buildNumber: String
+    public let deviceId: String
+    public let sessionId: String
 
     private let lock = NSLock()
     private var _userId: String?
     private var _networkType: String
     private var _foreground: Bool
 
-    var userId: String? {
+    public var userId: String? {
         get { lock.lock(); defer { lock.unlock() }; return _userId }
         set { lock.lock(); _userId = newValue; lock.unlock() }
     }
-    var networkType: String {
+    public var networkType: String {
         get { lock.lock(); defer { lock.unlock() }; return _networkType }
         set { lock.lock(); _networkType = newValue; lock.unlock() }
     }
-    var foreground: Bool {
+    public var foreground: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _foreground }
         set { lock.lock(); _foreground = newValue; lock.unlock() }
     }
@@ -130,14 +130,17 @@ enum TDReachability {
 
 /// One wire event. `fields` holds kind-specific top-level keys (schema-defined),
 /// `attributes` holds free-form detail and is always a JSON object.
-struct TDEvent {
-    let id: String
-    let ts: Date
-    let kind: String
-    let fields: [String: Any]
-    let attributes: [String: Any]
+///
+/// 对外可见：`TDEventSink` 是公开扩展点，自定义出口必须能读到事件内容。
+/// `payload(context:)` 仍为内部——组包格式是 SDK 与后端的约定，不该成为公开 API。
+public struct TDEvent {
+    public let id: String
+    public let ts: Date
+    public let kind: String
+    public let fields: [String: Any]
+    public let attributes: [String: Any]
 
-    init(kind: String, fields: [String: Any] = [:], attributes: [String: Any] = [:], ts: Date = Date()) {
+    public init(kind: String, fields: [String: Any] = [:], attributes: [String: Any] = [:], ts: Date = Date()) {
         self.id = UUID().uuidString.lowercased()
         self.ts = ts
         self.kind = kind

@@ -17,16 +17,16 @@ final class TDExitDiagnostics {
 
     private static let defaultsKey = "td_exit_counters"
 
-    private let transport: TDTransport
+    private let sink: TDEventSink
     private let defaults: UserDefaults
 
-    init(transport: TDTransport) {
-        self.transport = transport
+    init(sink: TDEventSink) {
+        self.sink = sink
         self.defaults = UserDefaults(suiteName: "com.truedepth.monitor") ?? .standard
     }
 
     func handle(_ metric: MXAppExitMetric) {
-        let snapshot = TDTerminationSnapshot.read()
+        let state = TDAppStateTracker.shared.current()
         let stored = (defaults.dictionary(forKey: Self.defaultsKey) as? [String: Int]) ?? [:]
         let isBaseline = stored.isEmpty
         var updated = stored
@@ -54,29 +54,41 @@ final class TDExitDiagnostics {
                     ? "内存超限被系统终止（MetricKit memoryResourceLimit，\(memoryDelta) 次）"
                     : "后台因内存压力被回收（MetricKit memoryPressure，\(pressureDelta) 次）",
             ]
-            if let footprint = snapshot?.footprintMb { fields["footprintMb"] = footprint }
-            if let limit = snapshot?.limitMb { fields["limitMb"] = limit }
-            transport.enqueue(TDEvent(
+            if let footprint = state?.lastFootprintMb { fields["footprintMb"] = footprint }
+            if let limit = state?.limitMb { fields["limitMb"] = limit }
+            sink.enqueue(TDEvent(
                 kind: "oom",
                 fields: fields,
                 attributes: [
-                    "source": "MetricKit",
+                    // source 必须与启发式路径区分：同一个退出可能被两条路径各报
+                    // 一次（MetricKit 次日批量 + 启发式下次启动即知）。后端按
+                    // source 分组统计，两者计数差可反推 MetricKit 的真实覆盖率。
+                    "source": "metrickit",
                     "memoryLimitExits": memoryDelta,
                     "memoryPressureExits": pressureDelta,
-                    "lastForegroundFootprintMb": snapshot?.footprintMb ?? 0,
-                    "lastForeground": snapshot?.foreground ?? false,
+                    "lastForegroundFootprintMb": state?.lastFootprintMb ?? 0,
+                    "lastForeground": state?.foreground ?? false,
+                    "lastScreen": state?.lastScreen ?? "-",
+                    // 与启发式路径带同一份证据。
+                    //
+                    // 之前这里只有单点（lastForegroundFootprintMb / lastScreen），
+                    // 而启发式路径带整条曲线——同一个 `oom` 事件，按 source 分开
+                    // 看会发现可查性差一半：MetricKit 更权威，反而证据更少。
+                    "footprintSeries": state?.footprintSeries ?? [],
+                    "timeline": state?.timelineEntries.map(\.asJSON) ?? [],
                 ]
             ))
         }
 
         if watchdogDelta > 0 {
-            transport.enqueue(TDEvent(
+            sink.enqueue(TDEvent(
                 kind: "mobile_metric",
                 fields: ["name": "watchdog", "value": Double(watchdogDelta), "severity": "error"],
-                attributes: ["source": "MetricKit", "reason": "app_watchdog_termination"]
+                attributes: ["source": "metrickit", "reason": "app_watchdog_termination",
+                             "applicationVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"]
             ))
         }
-        transport.flush()
+        sink.flush()
     }
 
     /// 累计计数 → 本次增量。首次见到某个 key 时以当前值为基线，返回 0。

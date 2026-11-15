@@ -11,7 +11,7 @@ final class TDCrashBridge {
 
     private static let maxBreadcrumbs = 100
 
-    private let transport: TDTransport
+    private let sink: TDEventSink
     private let defaults: UserDefaults
     private let breadcrumbs = TDBreadcrumbStore()
     private let lock = NSLock()
@@ -19,79 +19,129 @@ final class TDCrashBridge {
     /// 上次会话的面包屑。崩溃补发发生在新会话启动时，只有这份轨迹是有效的。
     private(set) var previousSessionBreadcrumbs: [[String: Any]] = []
 
-    init(transport: TDTransport) {
-        self.transport = transport
+    init(sink: TDEventSink) {
+        self.sink = sink
         self.defaults = UserDefaults(suiteName: "com.truedepth.monitor") ?? .standard
     }
 
     // MARK: - 会话与终止归因
 
-    func start() {
+    func start(termination: TDTerminationVerdict? = nil,
+               capabilities: TDCapabilityMatrix? = nil) {
         previousSessionBreadcrumbs = breadcrumbs.loadPreviousSession()
-        detectPreviousTermination()
         breadcrumbs.resetForNewSession()
-        defaults.set(false, forKey: "td_session_clean")
-        defaults.set(true, forKey: "td_has_launched")
+
+        // 能力矩阵挂在 session_start 上：每台设备每次启动都自报「我实际启用了
+        // 哪些采集器、哪些因系统版本降级、走的是哪条路径」。这样"iOS 13 用户
+        // 没有 OOM 数据"这类事实是数据里可见的，而不是藏在文档免责声明里。
+        var sessionAttributes: [String: Any] = capabilities?.attributes ?? [:]
+        // MetricKit 的真实投递次数：为 0 说明这个用户关闭了「共享 iPhone 分析」，
+        // 他的设备上永远不会有 MetricKit 数据。用它反推覆盖率，而不是靠猜。
+        sessionAttributes["metrickitPayloads"] = TDMetricKitCoverage.deliveryCount
+        if let verdict = termination {
+            sessionAttributes.merge(terminationAttributes(verdict)) { _, new in new }
+            reportTermination(verdict)
+        }
+
         addBreadcrumb(category: "app", message: "session_start", level: "info")
-        transport.enqueue(TDEvent(kind: "session_start"))
+        sink.enqueue(TDEvent(kind: "session_start", attributes: sessionAttributes))
     }
 
-    /// 上一次进程没有走 `stop()`：可能是崩溃、OOM、看门狗或用户强杀。
-    /// 这里只做**证据留存**，不冒充结论——真正的 OOM / Watchdog 由 MetricKit
-    /// 的退出原因计数确认（见 TDExitDiagnostics）。
-    private func detectPreviousTermination() {
-        let launchedBefore = defaults.bool(forKey: "td_has_launched")
-        let clean = defaults.bool(forKey: "td_session_clean")
-        let hadMemoryWarning = defaults.bool(forKey: "td_memory_warning")
-        defer { defaults.set(false, forKey: "td_memory_warning") }
-        guard launchedBefore, !clean else {
-            TDTerminationSnapshot.clear()
-            return
-        }
+    /// 上次退出的归因结果压成 session_start 的维度字段。
+    ///
+    /// 无论归因是哪一类都会挂在这里：unknown 不进 OOM 率，但必须可查——
+    /// 否则「有多少次退出我们根本说不清」这个问题永远没有答案。
+    private func terminationAttributes(_ verdict: TDTerminationVerdict) -> [String: Any] {
+        let state = verdict.state
+        return [
+            "prevTermination": verdict.attribution.rawValue,
+            "prevTerminationConfidence": verdict.confidence,
+            // 上次会话真实存活时长：startedAt → 最后一次心跳，而不是到现在的差值。
+            "prevSessionDurationMs": max(0, state.lastAliveAt.timeIntervalSince(state.startedAt) * 1000),
+            "prevPeakFootprintMb": state.peakFootprintMb,
+            "prevLastFootprintMb": state.lastFootprintMb ?? 0,
+            "prevLimitMb": state.limitMb ?? 0,
+            "prevMaxHangMs": state.maxHangMs,
+            "prevMemoryWarnings": state.memoryWarningCount,
+            "prevForeground": state.foreground,
+            "prevExitInitiator": state.exitInitiator ?? "-",
+            "prevScreen": state.lastScreen ?? "-",
+            "prevTracePoints": state.footprintSeries.count,
+            "prevEvidence": verdict.reasons.joined(separator: "; "),
+        ]
+    }
 
-        let snapshot = TDTerminationSnapshot.read()
-        if hadMemoryWarning {
-            recordOOM(footprintMb: snapshot?.footprintMb,
-                      reason: "memory_warning",
-                      message: "上次会话收到内存警告后未正常结束，疑似内存压力终止",
-                      limitMb: snapshot?.limitMb,
-                      breadcrumbs: previousSessionBreadcrumbs)
-        } else {
-            transport.enqueue(TDEvent(
-                kind: "mobile_metric",
-                fields: ["name": "watchdog", "value": 1, "severity": "info"],
-                attributes: [
-                    "reason": "unclean_exit",
-                    "lastFootprintMb": snapshot?.footprintMb ?? 0,
-                    "lastForeground": snapshot?.foreground ?? false,
-                ]
+    /// 只上报有本地证据支撑的归因。
+    ///
+    /// 刻意不做的事：`unknown_unclean` 不伪装成 OOM 或 watchdog。用户从后台
+    /// 上划强杀、系统因存储压力回收、越狱插件杀进程，在本地都无法与 OOM 区分；
+    /// 把它们算进 OOM 率会让这个指标彻底失去意义（老实现就是只要"没干净退出"
+    /// 就报一条 watchdog，导致强杀和 OOM 无法分开）。
+    private func reportTermination(_ verdict: TDTerminationVerdict) {
+        let state = verdict.state
+        switch verdict.attribution {
+        case .jetsam, .memoryPressure, .backgroundTaskTimeout:
+            var fields: [String: Any] = [
+                "reason": verdict.attribution == .jetsam ? "jetsam" : "memory_warning",
+                "message": "上次会话非正常结束：\(verdict.attribution.rawValue)",
+            ]
+            if let footprint = state.lastFootprintMb { fields["footprintMb"] = footprint }
+            if let limit = state.limitMb { fields["limitMb"] = limit }
+            sink.enqueue(TDEvent(
+                kind: "oom",
+                fields: fields,
+                attributes: terminationAttributes(verdict).merging([
+                    "source": "heuristic",
+                    "screen": state.lastScreen ?? "-",
+                    "footprintSeries": state.footprintSeries,
+                    // 因果链：内存 / 内存警告 / 页面 / 前后台 / 卡顿统一在一条时间轴上。
+                    // 单看「峰值 900MB、警告 2 次、最后停在详情页」回答不了
+                    // 「是缓慢泄漏还是一次性拉爆」，加上时间偏移就能。
+                    "timeline": state.timelineEntries.map(\.asJSON),
+                ]) { _, new in new }
             ))
+        case .watchdog:
+            sink.enqueue(TDEvent(
+                kind: "mobile_metric",
+                fields: ["name": "watchdog", "value": 1, "severity": "error"],
+                attributes: terminationAttributes(verdict).merging([
+                    "source": "heuristic",
+                    "reason": "main_thread_unresponsive",
+                    "maxHangMs": state.maxHangMs,
+                    // 看门狗杀进程前主线程一定长时间无响应，时间线上能看到
+                    // 「卡顿从第 N 秒开始持续到进程消失」。
+                    "timeline": state.timelineEntries.map(\.asJSON),
+                ]) { _, new in new }
+            ))
+        case .unknown:
+            TDMonitorLog.record(
+                "上次退出无法归因（不计入 OOM 率）：\(verdict.reasons.joined(separator: "; "))",
+                level: "warning")
         }
-        TDTerminationSnapshot.clear()
     }
-
-    func markCleanExit() {
-        defaults.set(true, forKey: "td_session_clean")
-        breadcrumbs.flush()
-    }
-
-    func markMemoryWarning() { defaults.set(true, forKey: "td_memory_warning") }
 
     func flushBreadcrumbs() { breadcrumbs.flush() }
 
     func endSession(uptimeMs: Double) {
-        transport.enqueue(TDEvent(kind: "session_end", fields: ["durationMs": uptimeMs]))
+        sink.enqueue(TDEvent(kind: "session_end", fields: ["durationMs": uptimeMs]))
     }
 
     // MARK: - 面包屑
 
     func addBreadcrumb(category: String, message: String, level: String = "info") {
         breadcrumbs.append(category: category, message: message, level: level)
-        transport.enqueue(TDEvent(
-            kind: "mobile_metric",
-            fields: ["name": "breadcrumb", "value": 1],
-            attributes: ["category": category, "message": String(message.prefix(200)), "level": level]
-        ))
+        // 带上当前页面：面包屑单独看只有一串文本，按页面聚合才能回答
+        // 「用户是在哪个页面走到这一步的」。fields 与 attributes 都写，
+        // 与 screen_render 事件保持同一口径（后端两条路径都可能取 screen）。
+        var fields: [String: Any] = ["name": "breadcrumb", "value": 1]
+        var attributes: [String: Any] = ["category": category,
+                                         "message": String(message.prefix(200)),
+                                         "level": level]
+        if let screen = TDScreenContext.shared.current {
+            fields["screen"] = screen
+            attributes["screen"] = screen
+        }
+        sink.enqueue(TDEvent(kind: "mobile_metric", fields: fields, attributes: attributes))
     }
 
     func snapshotBreadcrumbs() -> [[String: Any]] {
@@ -128,8 +178,8 @@ final class TDCrashBridge {
         if let loadAddress = TDBinaryImage.mainLoadAddress {
             attributes["appLoadAddress"] = String(format: "0x%llx", loadAddress)
         }
-        transport.enqueue(TDEvent(kind: "native_crash", fields: fields, attributes: attributes))
-        transport.flush()
+        sink.enqueue(TDEvent(kind: "native_crash", fields: fields, attributes: attributes))
+        sink.flush()
     }
 
     func recordNonFatal(message: String, stack: String?, category: String,
@@ -139,13 +189,18 @@ final class TDCrashBridge {
         var merged = attributes
         merged["category"] = category
         merged["breadcrumbs"] = snapshotBreadcrumbs()
-        transport.enqueue(TDEvent(kind: "error", fields: fields,
+        sink.enqueue(TDEvent(kind: "error", fields: fields,
                                   attributes: merged, ts: Date()))
     }
 
     func recordANR(durationMs: Double, stack: String? = nil, thresholdMs: Double? = nil,
                    sampleCount: Int? = nil, frames: [[String: Any]]? = nil,
-                   screen: String? = nil) {
+                   screen: String? = nil,
+                   reportThresholdMs: Double? = nil,
+                   severity: String? = nil,
+                   blockType: String? = nil,
+                   framesDuring: Int? = nil,
+                   foreground: Bool? = nil) {
         var fields: [String: Any] = ["durationMs": durationMs, "type": "main_thread_block"]
         if let stack = stack { fields["stack"] = String(stack.prefix(60_000)) }
         if let thresholdMs = thresholdMs { fields["thresholdMs"] = thresholdMs }
@@ -154,11 +209,24 @@ final class TDCrashBridge {
 
         // `anr` 的契约为 durationMs / thresholdMs / type / stack / sampleCount 五项，
         // 轨迹放在 attributes 里（顶层多出的键会被服务端按 schema 丢弃）。
+        //
+        // severity / blockType 也放 attributes 而不是顶层：`type` 保持
+        // `main_thread_block` 不变，后端既有分组统计与看板无需同步改造，
+        // 想按新维度看时再从 attributes 里取，属于向后兼容的加法。
         var attributes: [String: Any] = ["thresholdMs": thresholdMs ?? 0]
+        if let reportThresholdMs = reportThresholdMs {
+            attributes["reportThresholdMs"] = reportThresholdMs
+        }
+        // 卡顿分级：hang（2s~8s，进程活着）/ fatal_suspected（≥8s，大概率已被看门狗杀掉）
+        if let severity = severity { attributes["severity"] = severity }
+        // 阻塞类型：fully_blocked（期间一帧未出）/ partially_blocked（仍在出帧但很慢）
+        if let blockType = blockType { attributes["blockType"] = blockType }
+        if let framesDuring = framesDuring { attributes["framesDuring"] = framesDuring }
+        if let foreground = foreground { attributes["foreground"] = foreground }
         if let frames = frames, !frames.isEmpty { attributes["frames"] = frames }
         let trail = snapshotBreadcrumbs()
         if !trail.isEmpty { attributes["breadcrumbs"] = trail }
-        transport.enqueue(TDEvent(kind: "anr", fields: fields, attributes: attributes))
+        sink.enqueue(TDEvent(kind: "anr", fields: fields, attributes: attributes))
     }
 
     func recordOOM(footprintMb: Double?, reason: String, message: String? = nil,
@@ -169,12 +237,17 @@ final class TDCrashBridge {
         if let message = message { fields["message"] = message }
         let trail = breadcrumbs ?? snapshotBreadcrumbs()
         if !trail.isEmpty { fields["breadcrumbs"] = trail }
-        transport.enqueue(TDEvent(kind: "oom", fields: fields))
+        sink.enqueue(TDEvent(kind: "oom", fields: fields))
     }
 
     // MARK: - 网络 / 页面 / 自定义
 
     /// 一次请求：分阶段耗时进 attributes，聚合指标进 api_metric。
+    ///
+    /// `endpoint` / `traceId` 必须一路带到底：业务在门面里给每个接口起了归一化名字
+    /// （`finance.quote`、`api/v1/orders`），后端只能靠它做「按接口聚合」——
+    /// 一旦在落盘前丢了这个字段，就只能拿 URL 做字符串匹配，参数不同、域名轮换
+    /// 都会被拆成不同接口，聚合直接失效。
     func recordNetwork(
         url: String,
         method: String,
@@ -191,6 +264,8 @@ final class TDCrashBridge {
         category: String? = nil,
         retryAttempt: Int = 0,
         weakNetwork: Bool = false,
+        endpoint: String? = nil,
+        traceId: String? = nil,
         extraAttributes: [String: Any] = [:]
     ) {
         let path = TDCrashBridge.sanitizedURL(url)
@@ -205,9 +280,11 @@ final class TDCrashBridge {
         if let ttfbMs = ttfbMs { attributes["ttfbMs"] = ttfbMs }
         if let errorCode = errorCode { attributes["errorCode"] = errorCode }
         if weakNetwork { attributes["weakNetwork"] = true }
+        if let endpoint = endpoint { attributes["endpoint"] = endpoint }
+        if let traceId = traceId { attributes["traceId"] = traceId }
         extraAttributes.forEach { attributes[$0.key] = $0.value }
 
-        transport.enqueue(TDEvent(
+        sink.enqueue(TDEvent(
             kind: "mobile_metric",
             fields: ["name": "network_phase", "durationMs": durationMs,
                      "severity": success ? "info" : "warning"],
@@ -218,31 +295,39 @@ final class TDCrashBridge {
             "url": path, "method": method, "status": status,
             "durationMs": durationMs, "success": success,
         ]
+        // 聚合事件同样要带：`api_metric` 才是后端算成功率/P95 的那张表。
+        if let endpoint = endpoint { apiFields["endpoint"] = endpoint }
         if let requestBytes = requestBytes, requestBytes > 0 { apiFields["requestBytes"] = requestBytes }
         if let responseBytes = responseBytes, responseBytes > 0 { apiFields["responseBytes"] = responseBytes }
-        transport.enqueue(TDEvent(kind: "api_metric", fields: apiFields))
+        sink.enqueue(TDEvent(kind: "api_metric", fields: apiFields))
 
         // `network_error` 只记真正的网络/服务端失败：链路错误（errorCode）与 5xx。
         // 4xx 是业务语义（参数错、404），记进去只会把「网络质量」噪音化——
         // 它仍然体现在 api_metric.success=false 与 network_phase 的 status 上。
         let isNetworkFailure = errorCode != nil || status >= 500
         if !success && isNetworkFailure {
-            transport.enqueue(TDEvent(
+            var errorAttributes: [String: Any] = ["url": path, "method": method, "status": status,
+                                                  "errorCode": errorCode ?? 0,
+                                                  "category": category ?? "transport",
+                                                  "weakNetwork": weakNetwork]
+            if let endpoint = endpoint { errorAttributes["endpoint"] = endpoint }
+            if let traceId = traceId { errorAttributes["traceId"] = traceId }
+            sink.enqueue(TDEvent(
                 kind: "mobile_metric",
                 fields: ["name": "network_error", "value": 1, "severity": "warning"],
-                attributes: ["url": path, "method": method, "status": status,
-                             "errorCode": errorCode ?? 0,
-                             "category": category ?? "transport",
-                             "weakNetwork": weakNetwork]
+                attributes: errorAttributes
             ))
         }
         if let requestBytes = requestBytes, let responseBytes = responseBytes,
            requestBytes + responseBytes > 0 {
-            transport.enqueue(TDEvent(
+            var trafficAttributes: [String: Any] = ["url": path, "upBytes": requestBytes,
+                                                    "downBytes": responseBytes]
+            if let endpoint = endpoint { trafficAttributes["endpoint"] = endpoint }
+            sink.enqueue(TDEvent(
                 kind: "mobile_metric",
                 fields: ["name": "network_traffic",
                          "value": Double(requestBytes + responseBytes), "unit": "bytes"],
-                attributes: ["url": path, "upBytes": requestBytes, "downBytes": responseBytes]
+                attributes: trafficAttributes
             ))
         }
     }
@@ -250,7 +335,7 @@ final class TDCrashBridge {
     func recordViewLoad(screen: String, durationMs: Double, renderMs: Double? = nil) {
         var attributes: [String: Any] = ["screen": screen]
         if let renderMs = renderMs { attributes["loadMs"] = renderMs }
-        transport.enqueue(TDEvent(
+        sink.enqueue(TDEvent(
             kind: "mobile_metric",
             fields: ["name": "view_load", "durationMs": durationMs, "screen": screen],
             attributes: attributes
@@ -260,7 +345,7 @@ final class TDCrashBridge {
     func recordLongTask(durationMs: Double, screen: String?) {
         var attributes: [String: Any] = [:]
         if let screen = screen { attributes["screen"] = screen }
-        transport.enqueue(TDEvent(
+        sink.enqueue(TDEvent(
             kind: "mobile_metric",
             fields: ["name": "long_task", "durationMs": durationMs, "screen": screen ?? ""],
             attributes: attributes
@@ -274,7 +359,7 @@ final class TDCrashBridge {
         if let unit = unit { fields["unit"] = unit }
         var merged = attributes
         merged["metric"] = name
-        transport.enqueue(TDEvent(kind: "mobile_metric", fields: fields, attributes: merged))
+        sink.enqueue(TDEvent(kind: "mobile_metric", fields: fields, attributes: merged))
     }
 
     static func sanitizedURL(_ raw: String) -> String {
