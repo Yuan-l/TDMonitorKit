@@ -254,15 +254,18 @@ final class TDCrashBridge {
         if let stack = stack { fields["stack"] = String(stack.prefix(60_000)) }
         if let thresholdMs = thresholdMs { fields["thresholdMs"] = thresholdMs }
         if let sampleCount = sampleCount { fields["sampleCount"] = sampleCount }
-        if let screen = screen { fields["screen"] = screen }
 
         // `anr` 的契约为 durationMs / thresholdMs / type / stack / sampleCount 五项，
         // 轨迹放在 attributes 里（顶层多出的键会被服务端按 schema 丢弃）。
+        // `screen` 也是如此：后台 anrEventSchema 没有该字段，写顶层等于没写，
+        // 页面归因会恒为空，必须走 attributes。
         //
         // severity / blockType 也放 attributes 而不是顶层：`type` 保持
         // `main_thread_block` 不变，后端既有分组统计与看板无需同步改造，
         // 想按新维度看时再从 attributes 里取，属于向后兼容的加法。
         var attributes: [String: Any] = ["thresholdMs": thresholdMs ?? 0]
+        // 页面归因只能走 attributes：顶层 `screen` 会被 zod 直接剥掉。
+        if let screen = screen { attributes["screen"] = screen }
         if let reportThresholdMs = reportThresholdMs {
             attributes["reportThresholdMs"] = reportThresholdMs
         }

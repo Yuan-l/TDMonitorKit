@@ -3,6 +3,22 @@
 本组件遵循语义化版本。破坏性变更（事件语义、阈值口径、公开 API）一律升主版本号，
 并在下方写清「改了什么、为什么改、升级要做什么」。
 
+## 2.5.4
+
+**修复稳定性补验暴露的三处数据口径错位，并给队列压缩补上可核对的日志。** 公开 API 无变化，无需迁移。
+
+17:08 编译后的端到端补验 6 项主链路全部通过（422 归零、崩溃补发 `ts` = 崩溃真实时刻、ANR 真触发、OOM 不误报、天气边界样本隔离、行情无回归），但库里的数据又照出三处「能入库、口径却错」的问题：
+
+- 补发崩溃的 `symbolicated` 在 `TDCrashFeature` 里**硬编码 `false`**，可宿主 `callStackSymbols` 落盘的栈已经带符号名。后台 `bool_or(symbolicated)` 会把自采崩溃与 MetricKit 的未符号化诊断归成一类，符号化覆盖率直接失真。改为 `TDCrashReportParser` 按帧内符号判定（宿主报告若显式给 `symbolicated` 则优先），判定会排除 `0013A8B1-… + 185864` 这类 image UUID + offset 的未符号化系统库帧，避免把覆盖率反向算高；MetricKit 路径保持 `false`。
+- 补发崩溃的 `sessionId` 挂到了**重启后的新会话**：宿主报告 context 不带 sessionId，`originSessionId` 取不到。现由 `TDAppStateTracker` 在 `beginSession()` 留存上一会话现场，只有崩溃时刻落在 `startedAt...lastAliveAt`（±10s，覆盖落盘周期）窗口内才认领，不匹配就不硬挂；并用 `attributes.originSessionIdSource`（`host_report` / `app_state` / `unavailable`）如实标注来源，别把「没挂回」误读成「就是本次会话的崩溃」。
+- `recordANR` 把 `screen` 写在顶层 fields，后台 `anrEventSchema` 没这个字段，zod 直接剥掉 → `attributes.screen` 恒空，ANR 丢页面归因。现改放 `attributes.screen`。
+
+另：`compactIfNeeded()` 触发时补一条诊断日志（触发原因、压缩前后条数）。此前队列 `EntryCount` 跨会话涨到 352 只能靠猜；实际阈值是 `maxQueueSize/2 = 500`，属设计内行为，不是压缩没跑——现在可从 `diagnostics.log` 直接核对，**阈值语义未改**。
+
+离线校验：`TDMonitorKit` emit-module + 全源码 typecheck + 网络门面 typecheck 全部 `exit=0`；用后台真实 `telemetryIngestSchema` 验证旧 ANR 顶层 `screen` 被剥掉、新 `attributes.screen` 保留、补发崩溃 `symbolicated=true` 且 `sessionId` 为来源会话、ANR + 崩溃组合批次通过、`HH:mm:ss` 旧面包屑仍被 `Invalid date` 拒收。
+
+**仍待第三步处理（后台侧，本次未改后台）**：同一次崩溃的自采 `native_crash` 与 `source=metrickit` 诊断会被后台按 kind 直接相加，`crashCount` 翻倍；需按 `source` 分组 + `originId` 去重。端上两条事件已带来源标记。
+
 ## 2.5.3
 
 **修复崩溃补发被后台整批拒收、补发时间/会话错位，以及外部 SDK 边界样本污染传输层网络报表。** 公开 API 无删除，无需迁移。

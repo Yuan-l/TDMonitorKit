@@ -306,6 +306,9 @@ public final class TDAppStateTracker {
 
     private let queue = TDMonitorQueues.appState
     private var state: TDAppState?
+    /// `beginSession()` 读到的上一会话现场。文件随即被新会话覆盖，
+    /// 崩溃补发只能靠这份内存快照把事件挂回崩溃那次会话。
+    private var previousState: TDAppState?
     private var started = false
 
     private init() {}
@@ -324,6 +327,8 @@ public final class TDAppStateTracker {
                       appVersion: String,
                       buildNumber: String) -> TDTerminationVerdict? {
         let previous = TDAppState.read()
+        // 文件马上会被新会话覆盖，先把上一会话现场留在内存里。
+        queue.sync { self.previousState = previous }
         let defaults = UserDefaults(suiteName: "com.truedepth.monitor") ?? .standard
         let hasLaunchedBefore = defaults.bool(forKey: "td_has_launched")
         defaults.set(true, forKey: "td_has_launched")
@@ -371,6 +376,22 @@ public final class TDAppStateTracker {
         // 基线不必阻塞启动路径：异步写即可，首帧之前一定能完成。
         queue.async { fresh.write() }
         return verdict
+    }
+
+    /// 崩溃补发用：把 `native_crash` 挂回崩溃那次会话。
+    ///
+    /// 宿主崩溃报告的 context 不带 sessionId，但 `app_state.json` 记录了上一会话的
+    /// `sessionId` / `startedAt` / `lastAliveAt`。只有崩溃时刻落在存活区间内才认领：
+    /// 旧报告若被无条件挂到「最近一次会话」，等于把一种错误归因换成另一种。
+    /// 容差覆盖 5s 周期的现场落盘间隔，以及崩溃前最后一次写入与崩溃时刻的差值。
+    func originSessionId(for crashTime: Date) -> String? {
+        queue.sync {
+            guard let session = previousState else { return nil }
+            let tolerance: TimeInterval = 10
+            guard crashTime >= session.startedAt.addingTimeInterval(-tolerance),
+                  crashTime <= session.lastAliveAt.addingTimeInterval(tolerance) else { return nil }
+            return session.sessionId
+        }
     }
 
     // MARK: - 现场更新

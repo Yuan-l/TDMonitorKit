@@ -65,7 +65,9 @@
 
 1. **写放大**：旧实现每条事件都 `JSONSerialization` 整个 pending 数组再原子写盘。
    队列满（1000 条）时每来一条要重写约 600KB，且发生在持锁的串行队列上。
-   改为 JSONL 追加写，累计追加超过 `maxQueueSize/2` 才压缩一次。
+   改为 JSONL 追加写，累计追加超过 `maxQueueSize/2` 才压缩一次。（当前存储已升级为
+   mmap 记录级追加：CRC/AES/提交位点，压缩条件改为 `appendedSinceCompact > maxEvents/2`
+   或 `bloat > maxQueueSize/2`，触发时写诊断日志，见 `TDMMAPQueueStore` / `TDTransport`。）
 2. **假退避**：旧实现的 `backoff` 被计算，但从未用于排期——`retryLater` 只是延迟了
    网络回调的返回，重发时机仍由固定 10s timer 决定。所谓「指数退避」既不退避，
    还让一次 flush 多卡几秒。现在由 `scheduleRetry(after:)` 真正排期。

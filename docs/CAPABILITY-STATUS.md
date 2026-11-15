@@ -9,7 +9,7 @@
   不满足时不是坏了，是拿不到。
 - ❌ **有缺口** — 已知某类数据拿不到，原因和替代手段写在「缺口」列。
 
-最后更新：2026-11-15（按当前代码重新核对，不再沿用 2.0.0 的自述）
+最后更新：2026-11-15（2.5.4 稳定性补验后重新核对，不再沿用 2.0.0 的自述）
 
 > **口径说明**：文档按「观测项」编号 1–12（编号 5 的页面耗时并入页面渲染），
 > 代码里是 11 个 feature 单元，两者不是一一对应。别拿 feature 类数量核对能力清单。
@@ -36,8 +36,8 @@
 
 | 项 | 状态 | 实现 | 前提 | 缺口 |
 |---|---|---|---|---|
-| ANR | ✅ | `TDHangWatchdog`：独立线程信号量 ping，250ms 起采样、2s 上报、8s 标 `fatal_suspected`；卡顿期间 50ms 抓一次主线程栈 | — | 主线程被 SIGKILL 时事件发不出去，靠 `onProgress` 每秒落盘 + 下次启动归因兜底 |
-| 崩溃 | ⚠️ | `TDCrashFeature`：**不接管** handler，解析宿主落盘的 JSON 后补发，并补全面包屑与上一会话内存轨迹；补发事件的 `ts` 取崩溃真实时刻，带 `forwardedFromPreviousSession` / `crashOccurredAt` 标记 | 宿主必须设置 `TDMonitor.hostCrashReportPaths`；补发的嵌套字段必须过后台 `breadcrumbSchema` / `crashThreadSchema` | 不设 → **崩溃率恒为 0，且不报错**（2.0 起由接入自检点名）。采集质量取决于宿主 reporter。**2.5.3 前**：宿主面包屑 `timestamp` 只有 `HH:mm:ss.SSS`，被后台 `z.coerce.date()` 判为非法，导致整批 `native_crash` 422 拒收、自采崩溃全丢；现已统一归一化并在组包前清洗 |
+| ANR | ✅ | `TDHangWatchdog`：独立线程信号量 ping，250ms 起采样、2s 上报、8s 标 `fatal_suspected`；卡顿期间 50ms 抓一次主线程栈；**2.5.4 起**页面归因写 `attributes.screen`（写顶层会被 `anrEventSchema` 剥掉） | — | 主线程被 SIGKILL 时事件发不出去，靠 `onProgress` 每秒落盘 + 下次启动归因兜底 |
+| 崩溃 | ⚠️ | `TDCrashFeature`：**不接管** handler，解析宿主落盘的 JSON 后补发，并补全面包屑与上一会话内存轨迹；补发事件的 `ts` 取崩溃真实时刻，带 `forwardedFromPreviousSession` / `crashOccurredAt` 标记；**2.5.4 起** `symbolicated` 按宿主栈真实判定、`sessionId` 从上一会话现场按崩溃时间窗口认领（`originSessionIdSource` 标来源） | 宿主必须设置 `TDMonitor.hostCrashReportPaths`；补发的嵌套字段必须过后台 `breadcrumbSchema` / `crashThreadSchema` | 不设 → **崩溃率恒为 0，且不报错**（2.0 起由接入自检点名）。采集质量取决于宿主 reporter。**2.5.3 前**：宿主面包屑 `timestamp` 只有 `HH:mm:ss.SSS`，被后台 `z.coerce.date()` 判为非法，导致整批 `native_crash` 422 拒收、自采崩溃全丢；现已统一归一化并在组包前清洗。**后台侧待办（第三步）**：同一次崩溃的自采 `native_crash` 与 `source=metrickit` 诊断目前被按 kind 直接相加，`crashCount` 翻倍，需按 source 分组 + `originId` 去重 |
 | 非致命异常 | ✅ | 交换 `-[NSException raise]` + `TDMonitor.recordNonFatal` | — | 不交换 `objc_exception_throw`：那会把大量被正常 catch 的异常也收进来，噪声压过信号 |
 | OOM | ✅ | **启发式为主**（5 档，全版本、下次启动即知）+ MetricKit `MXAppExitMetric` 增量**补充校验**；两者都带 `footprintSeries` 与 `timeline` | 启发式需宿主 AppState 落盘；MetricKit 需 iOS 14+ 且用户开「共享 iPhone 分析」 | 能回答「什么时候、在哪个页面、从多少爬到多少、有没有内存警告」，**回答不了「哪一行分配的」**。MetricKit 在这台真机上 `deliveryCount=0`，不能当覆盖率来源 |
 

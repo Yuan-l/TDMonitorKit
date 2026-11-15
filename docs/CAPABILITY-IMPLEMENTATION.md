@@ -214,7 +214,7 @@
 
 ### 我们怎么实现的
 
-- **不装任何崩溃处理器（这是设计选择，不是外部约束）**：`TDCrashBridge` 只做一件事——解析宿主 `TBCrashReporter` 已经落盘的崩溃 JSON（`TDCrashReportParser`）→ 转成带结构化栈、镜像 UUID、加载基址、真实面包屑的 `native_crash` 事件；已补发过的 id 记住，重启不重复。我们**没有**注册第二个 signal/NSException/Mach handler，所以是"消费（consume）"宿主现场而非"捕获（capture）"。
+- **不装任何崩溃处理器（这是设计选择，不是外部约束）**：`TDCrashBridge` 只做一件事——解析宿主 `TBCrashReporter` 已经落盘的崩溃 JSON（`TDCrashReportParser`）→ 转成带结构化栈、镜像 UUID、加载基址、真实面包屑的 `native_crash` 事件；已补发过的 id 记住，重启不重复。2.5.4 起 `symbolicated` 按帧内符号判定（不再恒为 `false`），`sessionId` 从 `app_state.json` 的上一会话现场按崩溃时间窗口认领，并用 `attributes.originSessionIdSource` 标注来源——这三项直接决定后台的符号化覆盖率与崩溃率分母是否可信。我们**没有**注册第二个 signal/NSException/Mach handler，所以是"消费（consume）"宿主现场而非"捕获（capture）"。
 - **面包屑落盘 `TDBreadcrumbStore`**：100 条环形，节流写（>1s 才落盘，期间攒脏标记），进入后台/崩溃前 `flush`。崩溃是下次启动补发的，内存里的轨迹必然丢失，**所以必须落盘上次会话的轨迹**（`loadPreviousSession`），崩溃事件才能带上真实操作链。
 - **镜像 UUID `TDBinaryImage`**：直接从 Mach-O `LC_UUID` 读，不依赖私有接口；上报 `appUUID` + `appLoadAddress`（PIE 每次 slide 不同，没有基址事后无法 atos 还原行号）。
 - **把宿主缺口变指标**：每次启动检查"上次异常退出 && 无崩溃文件 → `crash_pipeline_missing`"——缺口有数字，不是静默。

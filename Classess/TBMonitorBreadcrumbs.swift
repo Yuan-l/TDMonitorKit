@@ -220,6 +220,8 @@ enum TDCrashReportParser {
         let message: String
         let stack: String?
         let frames: [[String: Any]]
+        /// 宿主是崩溃当场抓的 `callStackSymbols`，帧里带符号名；MetricKit 诊断才是未符号化的。
+        let symbolicated: Bool
         let signal: String?
         let exceptionType: String?
         let breadcrumbs: [[String: Any]]
@@ -239,6 +241,15 @@ enum TDCrashReportParser {
         let timestamp = (json["timestamp"] as? Double).map { Date(timeIntervalSince1970: $0) } ?? Date()
 
         let stackLines = json["stack"] as? [String]
+        let frames = structuredFrames(from: stackLines ?? [])
+        // 宿主在崩溃当场抓 `callStackSymbols`，App / Swift 帧里已有符号名；硬编码 false
+        // 会让后台把自采崩溃与 MetricKit 的未符号化诊断归成同一类，直接误导覆盖率。
+        // 但系统库帧常写成 `0013A8B1-… + 185864`（image UUID + offset），那不是符号，
+        // 只看「不以 0x 开头」会把它误判成已符号化，必须单独排除。
+        let symbolicated = (json["symbolicated"] as? Bool) ?? frames.contains { frame in
+            guard let symbol = frame["symbol"] as? String else { return false }
+            return looksLikeSymbol(symbol)
+        }
         let crumbs = (json["breadcrumbs"] as? [[String: Any]] ?? []).prefix(100).compactMap { raw -> [String: Any]? in
             guard let event = raw["event"] as? String, !event.isEmpty else { return nil }
             return [
@@ -253,12 +264,29 @@ enum TDCrashReportParser {
             timestamp: timestamp,
             message: message,
             stack: stackLines?.joined(separator: "\n"),
-            frames: structuredFrames(from: stackLines ?? []),
+            frames: frames,
+            symbolicated: symbolicated,
             signal: json["signal"] as? String,
             exceptionType: name,
             breadcrumbs: crumbs,
             context: (json["context"] as? [String: String]) ?? [:]
         )
+    }
+
+    /// 栈帧的 `symbol` 列不一定真是符号名：系统库没有本地符号时会写成
+    /// `0013A8B1-2524-3534-B5BA-681AAF18C798 + 185864`（image UUID + offset），
+    /// 也有裸 `0x…` 地址行。两者都以数字开头，不能算符号。
+    private static func looksLikeSymbol(_ raw: String) -> Bool {
+        let text = raw.trimmingCharacters(in: .whitespaces)
+        guard let first = text.first else { return false }
+        // UUID 既可能以数字开头（0013A8B1-…），也可能以字母开头
+        // （C05E486D-…），只看首字符挡不住，按整行格式识别。
+        let uuidFrame = "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(\\s|$)"
+        if text.range(of: uuidFrame, options: .regularExpression) != nil { return false }
+        if first.isNumber { return false }          // 裸地址 / 数字开头
+        // ObjC 方法 `-[Class sel]` / `+[Class sel]`、Swift mangled `$s…`、
+        // C/C++ 与系统符号（`objc_exception_throw`、`_dispatch_…`）。
+        return first.isLetter || first == "_" || first == "$" || first == "-" || first == "+"
     }
 
     /// 从宿主已有的文本栈里抽回地址，生成符号化脚本可消费的结构化帧。

@@ -238,9 +238,17 @@ final class TDTransport: TDEventSink {
     /// 追加写的必然结果：已成功发送的事件仍留在文件里，直到下一次压缩才消失。
     /// 每次发送完都全量重写，等于把追加写的好处又还回去。
     private func compactIfNeeded() {
-        let bloat = store.storedCount - pending.count
-        guard store.needsCompaction || bloat > config.maxQueueSize / 2 else { return }
+        let before = store.storedCount
+        let bloat = before - pending.count
+        let byAppend = store.needsCompaction
+        guard byAppend || bloat > config.maxQueueSize / 2 else { return }
         store.replace(with: pending)
+        // 触发与否此前只能靠猜：EntryCount 跨会话涨到 352 时，阈值其实是
+        // maxQueueSize/2 = 500，属于设计内行为。留一条可核对的痕迹，避免把
+        // 「还没到阈值」误判成「压缩逻辑没跑」。
+        TDMonitorLog.record(
+            "事件队列压缩：触发=\(byAppend ? "追加量" : "膨胀量") 磁盘 \(before) → \(store.storedCount) 条，待发 \(pending.count) 条",
+            level: "info")
     }
 
     private func scheduleRetry(after delay: TimeInterval) {

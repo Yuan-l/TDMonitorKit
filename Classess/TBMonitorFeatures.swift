@@ -112,18 +112,23 @@ final class TDCrashFeature: TDMonitorFeature {
                                              "forwardedFromPreviousSession": true]
             if let uuid = TDBinaryImage.mainUUID { attributes["appUUID"] = uuid }
 
-            // 宿主报告 context 里若带了会话 id，把崩溃挂回崩溃那次会话；
-            // TDEvent 只会接受合法 UUID，拿不到就保持当前会话并在 attributes 里留痕。
-            let originSessionId = parsed.context["sessionId"]
+            // 宿主报告 context 里若带了会话 id，优先用它；否则从上一会话现场反查。
+            // TDEvent 只接受合法 UUID；拿不到就保持当前会话，并把「为什么没挂回」
+            // 写进 attributes，别让后台把「没挂回」误读成「就是本次会话的崩溃」。
+            let fromHost = parsed.context["sessionId"]
                 ?? parsed.context["session_id"]
                 ?? parsed.context["td_session_id"]
+            let fromState = runtime.appState.originSessionId(for: parsed.timestamp)
+            let originSessionId = fromHost ?? fromState
+            attributes["originSessionIdSource"] = fromHost != nil ? "host_report"
+                : (fromState != nil ? "app_state" : "unavailable")
 
             bridge.recordCrash(
                 message: parsed.message,
                 stack: parsed.stack,
                 signal: parsed.signal,
                 exceptionType: parsed.exceptionType,
-                symbolicated: false,
+                symbolicated: parsed.symbolicated,
                 frames: parsed.frames,
                 breadcrumbs: parsed.breadcrumbs.isEmpty ? bridge.previousSessionBreadcrumbs : parsed.breadcrumbs,
                 extraAttributes: attributes,
