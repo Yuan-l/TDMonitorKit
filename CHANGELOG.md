@@ -3,6 +3,51 @@
 本组件遵循语义化版本。破坏性变更（事件语义、阈值口径、公开 API）一律升主版本号，
 并在下方写清「改了什么、为什么改、升级要做什么」。
 
+## 2.5.3
+
+**修复崩溃补发被后台整批拒收、补发时间/会话错位，以及外部 SDK 边界样本污染传输层网络报表。** 公开 API 无删除，无需迁移。
+
+真机补验（`TB_CRASH_TEST=exception` → 重启补发）发现接收端 4 次 `422 VALIDATION_ERROR`，
+客户端诊断日志记录 `fieldErrors.events = ["Invalid date" × 6]`。根因：宿主
+`TBCrashReporter` 落盘的面包屑 `timestamp` 只有时分秒（`"16:12:01.895"`），
+`TDCrashReportParser` 原样塞进 `breadcrumbs[].ts`，而后台 `breadcrumbSchema.ts`
+是 `z.coerce.date()`——一条非法日期让**整批 `native_crash` 被拒**。结果是自采的
+崩溃（符号化栈、面包屑、崩溃前现场）全部丢失，后台只剩 MetricKit 那条未符号化
+诊断：崩溃率和崩溃详情都是错的，这比没有数据更有误导性。
+
+修复：
+
+- 新增 `TDBreadcrumbStore.normalizedTimestamp(_:fallback:)`，统一收口 ISO8601、
+  秒/毫秒时间戳、`HH:mm:ss.SSS`（按崩溃当天重建，跨午夜回退一天）；解析不了
+  退回崩溃时刻，绝不把自由文本交给后台。
+- `recordCrash` 组包前按后台 `breadcrumbSchema` / `crashThreadSchema` 清洗嵌套
+  字段（ts / level / category / message / crashed / frames / 条数上限），避免同类
+  脏字段再次打死整批。
+- 补发事件的 `ts` 改用宿主报告的**崩溃真实时刻**（此前是下次启动时刻），并在
+  attributes 标 `forwardedFromPreviousSession` / `crashOccurredAt`；宿主 context
+  带合法 UUID 的 sessionId 时，由 `TDEvent.sessionIdOverride` 把崩溃挂回原会话，
+  不再错算到重启会话。
+
+用后台真实 `telemetryIngestSchema` 离线复现：旧值 `16:12:01.895` → 6 个
+`Invalid date`，归一化后通过；Swift 全源码 typecheck 通过。
+
+**同一轮补验还查出一处端上数据口径错误（外部 SDK 边界样本）**：查真机库发现
+46 条 `api_metric` 的 `url` 是 `sdk://qweather/...`，全部来自天气 SDK 的调用
+边界样本。它们没有 DNS/TCP/TLS/TTFB，`method` 写死 `GET`、`status` 是
+「成功 200 / 失败 0」的边界层映射值，而后台的网络 P95 / 成功率 / 慢接口报表
+正是按 `kind='api_metric'` + `GROUP BY method,url` 算的 —— 等于把「SDK 调用
+前后耗时」冒充真实 HTTP 传输请求，会把网络质量大盘算歪。这比没有数据更危险。
+
+修复：`TDBusinessMonitor recordExternalRequest` 改走新增的
+`TDMonitor.recordExternalRequest` / `TDCrashBridge.recordExternalRequest`，
+只产出 `mobile_metric(name=custom_metric)`，`attributes` 带
+`metric=external_sdk_request`、`domain=business_boundary`、`endpoint`、
+`logicalURL`（`sdk://` 仅作追溯）、`status`、`success`、`durationMs`。
+业务侧 10 个调用点签名不变、一行未改；数据一条不丢，但与传输层物理隔离。
+后台要展示边界层表现，按 `attributes.metric` 单独开视图。
+旧包已写入的那批 `sdk://` `api_metric` 是脏数据，正式接入前应清理，
+不要拿它做基线（建设阶段不为旧数据加兼容代码）。
+
 ## 2.5.2
 
 **修复「业务 `setScreen` 根本没进终止归因」的断链。** 公开 API 无变化，无需迁移。

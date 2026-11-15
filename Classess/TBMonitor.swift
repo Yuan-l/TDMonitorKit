@@ -470,6 +470,15 @@ public final class TDMonitor {
         bridge?.recordCustom(name: name, value: value, unit: unit, attributes: attributes)
     }
 
+    /// 外部二进制 SDK 的调用边界样本。**不是传输层网络指标**，不会产出
+    /// `api_metric` / `network_phase`，也就不会进网络 P95 / 成功率 / 慢接口报表。
+    /// 详见 `TDCrashBridge.recordExternalRequest` 的口径说明。
+    public func recordExternalRequest(endpoint: String, url: String, status: Int,
+                                      durationMs: Double, success: Bool, error: NSError?) {
+        bridge?.recordExternalRequest(endpoint: endpoint, url: url, status: status,
+                                      durationMs: durationMs, success: success, error: error)
+    }
+
     // MARK: - 崩溃补发
 
     /// 解析宿主落盘的 JSON 并转成 `native_crash`。已补发过的 id 会记住，
@@ -488,10 +497,13 @@ public final class TDMonitor {
 
         if environment["TD_MONITOR_SMOKE"] == "1" { emitSampleEvents() }
 
-        // 真实阻塞主线程 900ms，验证「阈值 → 栈采样 → 上报」整条链路。
+        // 真实阻塞主线程 2.5s：必须越过 `TDHangWatchdog` 的 2s 上报阈值，
+        // 才能验证 `anr` 事件（含主线程栈采样）而不只是 `long_task`。
+        // 900ms 那版只能验到 long_task，曾让「ANR 已验证」变成误判。
+        // 仍低于 8s 的 fatal_suspected 阈值，不会触发系统 watchdog 杀进程。
         if environment["TD_MONITOR_HANG_TEST"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                Thread.sleep(forTimeInterval: 0.9)
+                Thread.sleep(forTimeInterval: 2.5)
             }
         }
         if environment["TD_MONITOR_NONFATAL_TEST"] == "1" {

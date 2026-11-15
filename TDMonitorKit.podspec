@@ -1,6 +1,6 @@
 Pod::Spec.new do |spec|
   spec.name                  = "TDMonitorKit"
-  spec.version               = "2.5.2"
+  spec.version               = "2.5.3"
   spec.summary               = "TrueDepth 客户端统一监控组件：崩溃/ANR/OOM/页面帧率/启动/资源/网络指标采集与上报"
   spec.description           = <<-DESC
     一个按「Core 容器 + 可独立安装的能力单元」组织 iOS 监控 SDK：

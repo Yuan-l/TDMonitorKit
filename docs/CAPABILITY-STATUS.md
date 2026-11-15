@@ -37,7 +37,7 @@
 | 项 | 状态 | 实现 | 前提 | 缺口 |
 |---|---|---|---|---|
 | ANR | ✅ | `TDHangWatchdog`：独立线程信号量 ping，250ms 起采样、2s 上报、8s 标 `fatal_suspected`；卡顿期间 50ms 抓一次主线程栈 | — | 主线程被 SIGKILL 时事件发不出去，靠 `onProgress` 每秒落盘 + 下次启动归因兜底 |
-| 崩溃 | ⚠️ | `TDCrashFeature`：**不接管** handler，解析宿主落盘的 JSON 后补发，并补全面包屑与上一会话内存轨迹 | 宿主必须设置 `TDMonitor.hostCrashReportPaths` | 不设 → **崩溃率恒为 0，且不报错**（2.0 起由接入自检点名）。采集质量取决于宿主 reporter |
+| 崩溃 | ⚠️ | `TDCrashFeature`：**不接管** handler，解析宿主落盘的 JSON 后补发，并补全面包屑与上一会话内存轨迹；补发事件的 `ts` 取崩溃真实时刻，带 `forwardedFromPreviousSession` / `crashOccurredAt` 标记 | 宿主必须设置 `TDMonitor.hostCrashReportPaths`；补发的嵌套字段必须过后台 `breadcrumbSchema` / `crashThreadSchema` | 不设 → **崩溃率恒为 0，且不报错**（2.0 起由接入自检点名）。采集质量取决于宿主 reporter。**2.5.3 前**：宿主面包屑 `timestamp` 只有 `HH:mm:ss.SSS`，被后台 `z.coerce.date()` 判为非法，导致整批 `native_crash` 422 拒收、自采崩溃全丢；现已统一归一化并在组包前清洗 |
 | 非致命异常 | ✅ | 交换 `-[NSException raise]` + `TDMonitor.recordNonFatal` | — | 不交换 `objc_exception_throw`：那会把大量被正常 catch 的异常也收进来，噪声压过信号 |
 | OOM | ✅ | **启发式为主**（5 档，全版本、下次启动即知）+ MetricKit `MXAppExitMetric` 增量**补充校验**；两者都带 `footprintSeries` 与 `timeline` | 启发式需宿主 AppState 落盘；MetricKit 需 iOS 14+ 且用户开「共享 iPhone 分析」 | 能回答「什么时候、在哪个页面、从多少爬到多少、有没有内存警告」，**回答不了「哪一行分配的」**。MetricKit 在这台真机上 `deliveryCount=0`，不能当覆盖率来源 |
 
@@ -59,11 +59,14 @@
 | 层 | 天气 tab（`QWeather.framework` 二进制 SDK） |
 |---|---|
 | **传输层**：DNS / TCP / TLS / TTFB / 真实 HTTP 状态码 | 拿不到。SDK 自建 `NSURLSession`，业务换不了它的传输实现；iOS 18 上初始化器不可 swizzle，完成回调钩子也没命中（接收端 0 条 `*.qweather.net` 样本）。这一层**明确不采** |
-| **业务边界层**：哪个接口发起、耗时多久、成功失败、在哪个页面 | 完全拿得到。`QWeatherRequest.m` 在调用 SDK 前记起点，在 success / failure 回调里记终点，经 `TBBusinessMonitor recordExternalRequest` 产出 `network_phase` + `api_metric`，带 `endpoint=weather.*` |
+| **业务边界层**：哪个接口发起、耗时多久、成功失败、在哪个页面 | 完全拿得到。`QWeatherRequest.m` 在调用 SDK 前记起点，在 success / failure 回调里记终点，经 `TBBusinessMonitor recordExternalRequest` 产出 `mobile_metric(name=custom_metric)` + `attributes.metric=external_sdk_request`，带 `endpoint=weather.*` |
 
 `SDWebImage` / `WKWebView` 同理：传输层不采，但只要业务侧能观测到调用前后，就能补边界样本。
-真正走统一网络层的目前只有 `TBFinanceKit`（行情）；天气 tab 走的是边界 API，
-两条路产出同构事件，但口径不同，别混在同一张分段耗时报表里。
+真正走统一网络层的目前只有 `TBFinanceKit`（行情）；天气 tab 走的是边界 API。
+2.5.3 起两条路**产出不同 kind**：传输层是 `api_metric` + `network_*`，
+边界层是 `mobile_metric(name=custom_metric)`，物理隔离。此前边界样本也产
+`api_metric`，带 `sdk://qweather/...` 和伪造的 `status`/`method`，被后台
+`GROUP BY method,url` 的网络报表当成真实传输请求统计——看着有数据，口径是错的。
 
 | 路径 | 覆盖范围 | 分阶段耗时 | 业务改造 |
 |---|---|---|---|
@@ -93,8 +96,12 @@
 | AMapLocation / QNNetDiag 等三方 SDK | 各自建 session，只受 legacy swizzle 部分覆盖 |
 
 边界样本是**业务侧计时**，不是 `URLSessionTaskMetrics`：没有分段、没有真实 HTTP 状态码
-（SDK 回调成功记 200、`NSError` 记 0），URL 用 `sdk://` 逻辑标识以区别于真实出口。
-后端按 `endpoint` 聚合成功率 / P95 没问题，但不能拿它算 DNS/TLS 报表。
+（SDK 回调成功记 200、`NSError` 记 0），URL 用 `sdk://` 逻辑标识且只放在
+`attributes.logicalURL`。所以 2.5.3 起它不再写 `api_metric.url`：后台的慢接口 /
+网络 P95 / 成功率报表是按 `kind='api_metric'` + `GROUP BY method,url` 算的，
+边界样本混进去会把这些指标算歪。要看边界层表现，按
+`attributes.metric='external_sdk_request'` 单独聚合 `durationMs`，
+**不要和传输层放在同一张报表**。
 
 ## 5. 归因与观测
 

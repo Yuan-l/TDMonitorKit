@@ -161,16 +161,25 @@ final class TDCrashBridge {
         uptimeMs: Double? = nil,
         frames: [[String: Any]]? = nil,
         breadcrumbs: [[String: Any]]? = nil,
-        extraAttributes: [String: Any] = [:]
+        extraAttributes: [String: Any] = [:],
+        occurredAt: Date? = nil,
+        originSessionId: String? = nil
     ) {
+        // 补发事件的 ts 必须是崩溃发生时刻，不能是「下次启动那一刻」，
+        // 否则后台按时间看崩溃趋势、按会话看崩溃归属都会错位。
+        let crashTime = occurredAt ?? Date()
         var fields: [String: Any] = ["message": message, "symbolicated": symbolicated]
         if let stack = stack { fields["stack"] = stack }
         if let signal = signal { fields["signal"] = signal }
         if let exceptionType = exceptionType { fields["exceptionType"] = exceptionType }
-        if let threads = threads { fields["threads"] = threads }
+        if let threads = threads {
+            let safe = Self.sanitizedThreads(threads)
+            if !safe.isEmpty { fields["threads"] = safe }
+        }
         if let uptimeMs = uptimeMs { fields["uptimeMs"] = uptimeMs }
         let trail = breadcrumbs ?? snapshotBreadcrumbs()
-        if !trail.isEmpty { fields["breadcrumbs"] = trail }
+        let safeTrail = Self.sanitizedBreadcrumbs(trail, fallback: crashTime)
+        if !safeTrail.isEmpty { fields["breadcrumbs"] = safeTrail }
 
         var attributes = extraAttributes
         if let frames = frames, !frames.isEmpty { attributes["frames"] = frames }
@@ -178,8 +187,48 @@ final class TDCrashBridge {
         if let loadAddress = TDBinaryImage.mainLoadAddress {
             attributes["appLoadAddress"] = String(format: "0x%llx", loadAddress)
         }
-        sink.enqueue(TDEvent(kind: "native_crash", fields: fields, attributes: attributes))
+        if occurredAt != nil {
+            attributes["forwardedFromPreviousSession"] = true
+            attributes["crashOccurredAt"] = TDISO8601.string(from: crashTime)
+        }
+        if let originSessionId = originSessionId {
+            attributes["originSessionId"] = originSessionId
+        }
+        sink.enqueue(TDEvent(kind: "native_crash", fields: fields, attributes: attributes,
+                             ts: crashTime, sessionIdOverride: originSessionId))
         sink.flush()
+    }
+
+    /// 按后台 `breadcrumbSchema` 收口嵌套字段。
+    /// 一条非法 `ts` / 越界 `level` 会让**整个批次** 422，代价远大于逐条清洗。
+    private static func sanitizedBreadcrumbs(_ raw: [[String: Any]],
+                                             fallback: Date) -> [[String: Any]] {
+        raw.prefix(100).compactMap { crumb in
+            let category = String((crumb["category"] as? String ?? "").prefix(64))
+            guard !category.isEmpty else { return nil }
+            return [
+                "ts": TDBreadcrumbStore.normalizedTimestamp(
+                    crumb["ts"] ?? crumb["timestamp"], fallback: fallback),
+                "category": category,
+                "message": String((crumb["message"] as? String ?? "").prefix(512)),
+                "level": TDBreadcrumbStore.normalizedLevel(crumb["level"] as? String ?? "info"),
+            ]
+        }
+    }
+
+    /// 按后台 `crashThreadSchema` 收口：`crashed` 必填 Bool、`frames` 必须是字符串数组。
+    private static func sanitizedThreads(_ raw: [[String: Any]]) -> [[String: Any]] {
+        raw.prefix(32).map { thread in
+            let frames = (thread["frames"] as? [Any] ?? []).prefix(256).compactMap { value -> String? in
+                guard let text = value as? String else { return nil }
+                return String(text.prefix(512))
+            }
+            return [
+                "name": String((thread["name"] as? String ?? "unknown").prefix(128)),
+                "crashed": (thread["crashed"] as? Bool) ?? false,
+                "frames": frames,
+            ]
+        }
     }
 
     func recordNonFatal(message: String, stack: String?, category: String,
@@ -348,6 +397,41 @@ final class TDCrashBridge {
         sink.enqueue(TDEvent(
             kind: "mobile_metric",
             fields: ["name": "long_task", "durationMs": durationMs, "screen": screen ?? ""],
+            attributes: attributes
+        ))
+    }
+
+    /// 外部二进制 SDK 的「业务边界层」样本。
+    ///
+    /// 这类观测只有「调用了哪个接口 / 耗时 / 成败」，没有 DNS/TCP/TLS/TTFB，
+    /// `status` / `method` 也是边界层映射出来的，不是真实 HTTP 响应。早先把它
+    /// 接到 `recordNetwork` 上，会产出带 `sdk://qweather/...` 的 `api_metric`；
+    /// 后台按 `kind='api_metric'` + `GROUP BY method,url` 算网络 P95、成功率、
+    /// 慢接口，于是把「SDK 调用前后」当成了传输请求统计 —— 数据看着完整，
+    /// 其实口径是错的。真机库里已经能查到这批误入的样本。
+    ///
+    /// 因此单独走 `mobile_metric(name=custom_metric)`：数据一条不丢，但与传输层
+    /// 指标物理隔离。后台要展示时按 `metric=external_sdk_request` 单独开视图。
+    func recordExternalRequest(endpoint: String, url: String, status: Int,
+                               durationMs: Double, success: Bool, error: NSError?) {
+        var attributes: [String: Any] = [
+            "metric": "external_sdk_request",
+            "domain": "business_boundary",
+            "observedLayer": "business_boundary",
+            "endpoint": endpoint,
+            "logicalURL": url,
+            "status": status,
+            "success": success,
+        ]
+        if let error = error {
+            attributes["errorCode"] = error.code
+            attributes["errorDomain"] = error.domain
+        }
+        sink.enqueue(TDEvent(
+            kind: "mobile_metric",
+            fields: ["name": "custom_metric",
+                     "durationMs": max(0, durationMs),
+                     "severity": success ? "info" : "warning"],
             attributes: attributes
         ))
     }

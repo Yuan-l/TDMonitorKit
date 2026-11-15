@@ -122,6 +122,76 @@ public final class TDBreadcrumbStore {
         }
     }
 
+    private static let plainISO8601: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    /// 把宿主崩溃报告里自由格式的 `timestamp` 收口成后台可解析的 ISO8601。
+    ///
+    /// 后台 `breadcrumbSchema.ts` 的 `ts` 是 `z.coerce.date()`：只要有一条非法日期，
+    /// **整个 `native_crash` 批次**就会被 422 拒掉。真机上已经发生过：自采的崩溃
+    /// （带符号化栈、面包屑、现场）全部消失，后台只剩 MetricKit 的未符号化诊断。
+    /// 这种「一条脏字段打死一整批」的代价，必须在组包前消掉。
+    /// 支持：ISO8601（带/不带小数秒）、秒/毫秒时间戳、常见本地时间文本。
+    static func normalizedTimestamp(_ raw: Any?, fallback: Date) -> String {
+        if let number = raw as? NSNumber, let date = date(fromEpoch: number.doubleValue) {
+            return TDISO8601.string(from: date)
+        }
+        if let text = raw as? String, !text.isEmpty {
+            if let date = TDISO8601.formatter.date(from: text) ?? plainISO8601.date(from: text) {
+                return TDISO8601.string(from: date)
+            }
+            if let seconds = Double(text), let date = date(fromEpoch: seconds) {
+                return TDISO8601.string(from: date)
+            }
+            // 宿主 `TBCrashReporter` 的面包屑只写 `HH:mm:ss.SSS`（无日期）。
+            // 这正是真机 422 的元凶：`new Date("16:12:01.895")` 是 Invalid Date。
+            // 崩溃报告的 epoch 给了确定日期，按崩溃当天重建，保留轨迹的先后顺序。
+            if let date = reconstructedTime(text, relativeTo: fallback) {
+                return TDISO8601.string(from: date)
+            }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            for pattern in ["yyyy-MM-dd HH:mm:ss ZZZ", "yyyy-MM-dd HH:mm:ss", "yyyy/MM/dd HH:mm:ss"] {
+                formatter.dateFormat = pattern
+                if let date = formatter.date(from: text) {
+                    return TDISO8601.string(from: date)
+                }
+            }
+        }
+        // 解析不了就退回崩溃时刻，绝不能把原始自由文本塞给后台。
+        return TDISO8601.string(from: fallback)
+    }
+
+    /// 把 `HH:mm:ss.SSS` 补成崩溃当天的绝对时刻；跨午夜时回退一天。
+    /// 用设备本地日历拼接（宿主 formatter 也是本地时区），输出再统一转 UTC ISO8601。
+    private static func reconstructedTime(_ text: String, relativeTo crash: Date) -> Date? {
+        let parts = text.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              let hour = Int(parts[0]), (0..<24).contains(hour),
+              let minute = Int(parts[1]), (0..<60).contains(minute),
+              let second = Double(parts[2]), second >= 0, second < 60 else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        var components = calendar.dateComponents([.year, .month, .day], from: crash)
+        components.hour = hour
+        components.minute = minute
+        components.second = Int(second)
+        guard var date = calendar.date(from: components) else { return nil }
+        if date.timeIntervalSince(crash) > 60 {
+            date = calendar.date(byAdding: .day, value: -1, to: date) ?? date
+        }
+        return date
+    }
+
+    /// 秒级与毫秒级时间戳都接受，避免把毫秒当秒得到公元 57000 年。
+    private static func date(fromEpoch value: Double) -> Date? {
+        guard value > 0, value.isFinite else { return nil }
+        return Date(timeIntervalSince1970: value > 100_000_000_000 ? value / 1000 : value)
+    }
+
     /// 新会话开始：清空磁盘上的旧轨迹，避免与本次会话混在一起。
     func resetForNewSession() {
         lock.lock()
@@ -165,14 +235,19 @@ enum TDCrashReportParser {
         let type = json["type"] as? String ?? "unknown"
         let message = reason ?? name ?? "崩溃（\(type)）"
 
-        let stackLines = json["stack"] as? [String]
-        let crumbs = (json["breadcrumbs"] as? [[String: Any]] ?? []).compactMap { raw -> [String: Any]? in
-            guard let event = raw["event"] as? String else { return nil }
-            let ts = raw["timestamp"] as? String ?? TDISO8601.string(from: Date())
-            return ["ts": ts, "category": "host", "message": String(event.prefix(512)), "level": "info"]
-        }
-
+        // 崩溃真实时刻：后面既作为 `native_crash.ts`，也作为无法解析的面包屑时间兜底。
         let timestamp = (json["timestamp"] as? Double).map { Date(timeIntervalSince1970: $0) } ?? Date()
+
+        let stackLines = json["stack"] as? [String]
+        let crumbs = (json["breadcrumbs"] as? [[String: Any]] ?? []).prefix(100).compactMap { raw -> [String: Any]? in
+            guard let event = raw["event"] as? String, !event.isEmpty else { return nil }
+            return [
+                "ts": TDBreadcrumbStore.normalizedTimestamp(raw["timestamp"], fallback: timestamp),
+                "category": "host",
+                "message": String(event.prefix(512)),
+                "level": "info",
+            ]
+        }
         return Parsed(
             id: json["id"] as? String ?? url.lastPathComponent,
             timestamp: timestamp,

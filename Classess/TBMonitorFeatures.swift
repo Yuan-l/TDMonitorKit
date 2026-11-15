@@ -108,8 +108,15 @@ final class TDCrashFeature: TDMonitorFeature {
             guard let parsed = TDCrashReportParser.parse(url: URL(fileURLWithPath: path)) else { continue }
             if forwarded.contains(parsed.id) { continue }
 
-            var attributes: [String: Any] = ["source": "TBCrashReporter"]
+            var attributes: [String: Any] = ["source": "TBCrashReporter",
+                                             "forwardedFromPreviousSession": true]
             if let uuid = TDBinaryImage.mainUUID { attributes["appUUID"] = uuid }
+
+            // 宿主报告 context 里若带了会话 id，把崩溃挂回崩溃那次会话；
+            // TDEvent 只会接受合法 UUID，拿不到就保持当前会话并在 attributes 里留痕。
+            let originSessionId = parsed.context["sessionId"]
+                ?? parsed.context["session_id"]
+                ?? parsed.context["td_session_id"]
 
             bridge.recordCrash(
                 message: parsed.message,
@@ -119,7 +126,9 @@ final class TDCrashFeature: TDMonitorFeature {
                 symbolicated: false,
                 frames: parsed.frames,
                 breadcrumbs: parsed.breadcrumbs.isEmpty ? bridge.previousSessionBreadcrumbs : parsed.breadcrumbs,
-                extraAttributes: attributes
+                extraAttributes: attributes,
+                occurredAt: parsed.timestamp,
+                originSessionId: originSessionId
             )
             forwarded.insert(parsed.id)
             count += 1

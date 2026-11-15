@@ -139,17 +139,23 @@ public struct TDEvent {
     public let kind: String
     public let fields: [String: Any]
     public let attributes: [String: Any]
+    /// 崩溃补发这类「事件发生在上一个会话」的场景，用真实会话 id 覆盖当前上下文。
+    /// 只接受合法 UUID，避免把宿主报告里的自由文本带进后台的 sessionIdSchema。
+    public let sessionIdOverride: String?
 
-    public init(kind: String, fields: [String: Any] = [:], attributes: [String: Any] = [:], ts: Date = Date()) {
+    public init(kind: String, fields: [String: Any] = [:], attributes: [String: Any] = [:],
+                ts: Date = Date(), sessionIdOverride: String? = nil) {
         self.id = UUID().uuidString.lowercased()
         self.ts = ts
         self.kind = kind
         self.fields = fields
         self.attributes = attributes
+        self.sessionIdOverride = sessionIdOverride.flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
     }
 
     func payload(context: TDContext) -> [String: Any] {
         var body = context.baseFields
+        if let origin = sessionIdOverride { body["sessionId"] = origin }
         body["id"] = id
         body["ts"] = TDISO8601.string(from: ts)
         body["kind"] = kind
