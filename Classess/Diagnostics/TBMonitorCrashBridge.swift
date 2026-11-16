@@ -439,15 +439,41 @@ final class TDCrashBridge {
         ))
     }
 
+    /// 通用自定义指标逃生口。当前业务层零调用，为防未来被借去塞业务 KPI
+    /// （污染 mobile_metric 统一口径），2026-11-17 加三道轻量护栏：
+    ///   1) metric 名须为 [a-z0-9_.]，挡住自由文本/中文 KPI 名；
+    ///   2) 过滤 attributes 中会被 payload 覆盖或污染 schema 的保留字段；
+    ///   3) 打 source="custom" 标记，便于后台单独审计这类指标。
+    /// 非法名直接丢弃并记 diagnostics，不 enqueue。
     func recordCustom(name: String, value: Double? = nil, unit: String? = nil,
                       attributes: [String: Any] = [:]) {
+        guard Self.isValidCustomMetricName(name) else {
+            TDMonitorLog.record("recordCustom 拒绝非法 metric 名: \(name)", level: "warning")
+            return
+        }
         var fields: [String: Any] = ["name": "custom_metric"]
-        if let value = value { fields["value"] = value }
+        if let value = value, value.isFinite { fields["value"] = value }
         if let unit = unit { fields["unit"] = unit }
-        var merged = attributes
+        var merged = attributes.filter { !Self.reservedEventKeys.contains($0.key) }
         merged["metric"] = name
+        merged["source"] = "custom"
         sink.enqueue(TDEvent(kind: "mobile_metric", fields: fields, attributes: merged))
     }
+
+    /// 允许的小写 snake/dot 命名，长度 1..64。禁止空名、大写、空格、中文与路径分隔符。
+    /// internal 供单测覆盖（@testable import）。
+    static func isValidCustomMetricName(_ name: String) -> Bool {
+        guard (1...64).contains(name.count) else { return false }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789_.")
+        return name.unicodeScalars.allSatisfy { allowed.contains($0) }
+    }
+
+    /// 这些键由 TDEvent.payload / TDContext 写入，允许用户 attributes 覆盖会污染事件 schema。
+    private static let reservedEventKeys: Set<String> = [
+        "id", "ts", "kind", "type", "sessionId", "environment", "appVersion",
+        "buildNumber", "os", "osVersion", "deviceModel", "networkType", "foreground",
+        "appId", "deviceId", "release", "userId",
+    ]
 
     static func sanitizedURL(_ raw: String) -> String {
         guard var components = URLComponents(string: raw) else { return raw }
