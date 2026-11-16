@@ -60,7 +60,7 @@ final class TDTransport: TDEventSink {
         self.config = configuration
         self.context = context
 
-        // 唯一落盘实现：共享 mmap 底座（TBCustomNetworkLogger 的 TBMMAPLogFile），
+        // 唯一落盘实现：共享 mmap 底座（TBMMAPStorageKit 的 TBMMAPLogFile），
         // 每条 CRC32 + AES + msync 提交位点，断电/强杀都只丢最后一批。
         // 依赖注入可换成内存实现；没有旧格式需要读取或迁移。
         self.store = store ?? TDMMAPQueueStore(directory: TDTransport.storeDirectory(),

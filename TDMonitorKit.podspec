@@ -21,9 +21,10 @@ Pod::Spec.new do |spec|
 
   spec.source_files          = "Classess/**/*.swift"
   spec.frameworks            = "Foundation", "UIKit", "SystemConfiguration"
-  # 事件队列落盘复用宿主自研的 mmap 底座（TBMMAPLogFile / TBMMAPRecordStore）：
+  # 事件队列落盘复用独立 L0 底座 TBMMAPStorageKit（TBMMAPLogFile / TBMMAPRecordStore）：
   # 每条 CRC32 + AES-256-CBC + msync 提交位点，不另起一套持久化实现。
-  spec.dependency            "TBCustomNetworkLogger"
+  # 2026-11-17 从 TBCustomNetworkLogger 抽出——TD 不再依赖退役上报器组件。
+  spec.dependency            "TBMMAPStorageKit"
   # MetricKit diagnostics are iOS 14+ and guarded with @available / canImport.
   spec.weak_frameworks       = "MetricKit"
   spec.requires_arc          = true

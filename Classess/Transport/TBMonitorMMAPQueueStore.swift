@@ -1,13 +1,12 @@
 import Foundation
-import TBCustomNetworkLogger
+import TBMMAPStorageKit
 
 /// 事件队列的 mmap 落盘实现。
 ///
 /// ## 为什么不是另一套持久化
 ///
 /// 这里**没有**重新实现文件布局、CRC、加密、提交位点或扩容逻辑。底层直接复用
-/// `TBCustomNetworkLogger` 里的 `TBMMAPRecordStore` → `TBMMAPLogFile`，也就是宿主
-/// 最初那套自研 mmap 方案：
+/// 独立 L0 底座 `TBMMAPStorageKit` 里的 `TBMMAPRecordStore` → `TBMMAPLogFile`：
 ///
 /// ```
 /// 56B 文件头(magic/version/entryCount/dataLength/flags)
