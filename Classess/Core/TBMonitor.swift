@@ -258,6 +258,11 @@ public final class TDMonitor {
     /// 宿主可注入崩溃报告文件路径，避免为了一个回调引入组件依赖。
     public static var hostCrashReportPaths: (() -> [String])?
 
+    /// 宿主可注入崩溃镜像快照读取：入参是崩溃 context 的 `binaryImagesFile`，
+    /// 返回 name/uuid/loadAddress/size 数组。崩溃是下次启动补发的，必须用崩溃进程
+    /// 落盘的快照，不能用补发进程的 dyld 基址——这是 dSYM 符号化的前提。
+    public static var hostBinaryImages: ((String) -> [[String: Any]])?
+
     /// 注册一个自定义能力类型，使其在 `start()` 时被安装。
     ///
     /// 用于在不 fork SDK 的前提下扩展采集能力：自定义能力只需遵循

@@ -226,6 +226,8 @@ enum TDCrashReportParser {
         let exceptionType: String?
         let breadcrumbs: [[String: Any]]
         let context: [String: String]
+        /// 崩溃进程启动时落盘的镜像清单（name/uuid/loadAddress/size），dSYM 符号化前提。
+        let binaryImages: [[String: Any]]
     }
 
     static func parse(url: URL) -> Parsed? {
@@ -259,6 +261,10 @@ enum TDCrashReportParser {
                 "level": "info",
             ]
         }
+        let context = (json["context"] as? [String: String]) ?? [:]
+        // 镜像快照只存文件名（context 限 8KB），实际内容由宿主闭包按文件名读回。
+        let binaryImagesFile = context["binaryImagesFile"] ?? ""
+        let binaryImages = binaryImagesFile.isEmpty ? [] : (TDMonitor.hostBinaryImages?(binaryImagesFile) ?? [])
         return Parsed(
             id: json["id"] as? String ?? url.lastPathComponent,
             timestamp: timestamp,
@@ -269,7 +275,8 @@ enum TDCrashReportParser {
             signal: json["signal"] as? String,
             exceptionType: name,
             breadcrumbs: crumbs,
-            context: (json["context"] as? [String: String]) ?? [:]
+            context: context,
+            binaryImages: binaryImages
         )
     }
 

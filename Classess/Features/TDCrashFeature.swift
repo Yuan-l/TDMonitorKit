@@ -51,7 +51,15 @@ final class TDCrashFeature: TDMonitorFeature {
 
             var attributes: [String: Any] = ["source": "TBCrashReporter",
                                              "forwardedFromPreviousSession": true]
-            if let uuid = TDBinaryImage.mainUUID { attributes["appUUID"] = uuid }
+
+            // dSYM 符号化前提：用崩溃进程落盘的镜像快照，而不是补发进程的 dyld 基址。
+            // 补发是「下次启动」的新进程，mainUUID/mainLoadAddress 都指向错误的进程。
+            // 主二进制 = dyld image 0（快照按 index 顺序采集），其余为动态库镜像。
+            if let mainImage = parsed.binaryImages.first {
+                if let uuid = mainImage["uuid"] as? String { attributes["appUUID"] = uuid }
+                if let load = mainImage["loadAddress"] as? String { attributes["appLoadAddress"] = load }
+            }
+            if !parsed.binaryImages.isEmpty { attributes["binaryImages"] = parsed.binaryImages }
 
             // 宿主报告 context 里若带了会话 id，优先用它；否则从上一会话现场反查。
             // TDEvent 只接受合法 UUID；拿不到就保持当前会话，并把「为什么没挂回」

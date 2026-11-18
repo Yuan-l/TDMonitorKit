@@ -183,8 +183,13 @@ final class TDCrashBridge {
 
         var attributes = extraAttributes
         if let frames = frames, !frames.isEmpty { attributes["frames"] = frames }
-        if let uuid = TDBinaryImage.mainUUID { attributes["appUUID"] = uuid }
-        if let loadAddress = TDBinaryImage.mainLoadAddress {
+        // 补发事件已由崩溃现场快照填好 appUUID/appLoadAddress（见 TDCrashFeature），
+        // 不能用补发进程的 dyld 基址覆盖——那样符号化会按错误的镜像偏移查表。
+        // 只有调用方没提供时（实时崩溃）才用当前进程兜底。
+        if attributes["appUUID"] == nil, let uuid = TDBinaryImage.mainUUID {
+            attributes["appUUID"] = uuid
+        }
+        if attributes["appLoadAddress"] == nil, let loadAddress = TDBinaryImage.mainLoadAddress {
             attributes["appLoadAddress"] = String(format: "0x%llx", loadAddress)
         }
         if occurredAt != nil {
