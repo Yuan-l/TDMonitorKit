@@ -242,8 +242,19 @@ enum TDCrashReportParser {
         // 崩溃真实时刻：后面既作为 `native_crash.ts`，也作为无法解析的面包屑时间兜底。
         let timestamp = (json["timestamp"] as? Double).map { Date(timeIntervalSince1970: $0) } ?? Date()
 
+        let context = (json["context"] as? [String: String]) ?? [:]
+        // 镜像快照只存文件名（context 限 8KB），实际内容由宿主闭包按文件名读回。
+        let binaryImagesFile = context["binaryImagesFile"] ?? ""
+        let binaryImages = binaryImagesFile.isEmpty ? [] : (TDMonitor.hostBinaryImages?(binaryImagesFile) ?? [])
+
+        // 信号崩溃：C handler 只落裸地址帧 rawFrames（信号上下文禁用 dladdr）。
+        // 这里在安全上下文用崩溃现场快照把地址归属到镜像，产后台可消费的结构化帧，
+        // symbol 留空由后台 dSYM 索引按 UUID+offset 回填。NSException / 历史报告
+        // 没有 rawFrames，仍走 stack 文本解析，两条路径互不干扰。
+        let rawAddresses = json["rawFrames"] as? [String] ?? []
+        let rawFrames = Self.structuredFrames(fromRawAddresses: rawAddresses, binaryImages: binaryImages)
         let stackLines = json["stack"] as? [String]
-        let frames = structuredFrames(from: stackLines ?? [])
+        let frames = rawFrames.isEmpty ? Self.structuredFrames(from: stackLines ?? []) : rawFrames
         // 宿主在崩溃当场抓 `callStackSymbols`，App / Swift 帧里已有符号名；硬编码 false
         // 会让后台把自采崩溃与 MetricKit 的未符号化诊断归成同一类，直接误导覆盖率。
         // 但系统库帧常写成 `0013A8B1-… + 185864`（image UUID + offset），那不是符号，
@@ -261,10 +272,6 @@ enum TDCrashReportParser {
                 "level": "info",
             ]
         }
-        let context = (json["context"] as? [String: String]) ?? [:]
-        // 镜像快照只存文件名（context 限 8KB），实际内容由宿主闭包按文件名读回。
-        let binaryImagesFile = context["binaryImagesFile"] ?? ""
-        let binaryImages = binaryImagesFile.isEmpty ? [] : (TDMonitor.hostBinaryImages?(binaryImagesFile) ?? [])
         return Parsed(
             id: json["id"] as? String ?? url.lastPathComponent,
             timestamp: timestamp,
@@ -320,4 +327,51 @@ enum TDCrashReportParser {
         }
         return frames
     }
+
+    /// 信号崩溃的裸地址帧 -> 结构化帧。
+    ///
+    /// 信号上下文不能调 dladdr（非 async-signal-safe），所以 C handler 只落
+    /// `["0x..."]` 地址数组；地址到镜像的归属在这里（下次启动的安全上下文）
+    /// 按崩溃现场快照的 [loadAddress, loadAddress+size) 匹配。
+    /// - module 直接用快照里的 name 原值，后台 `normalizeModule` 会去路径/后缀，
+    ///   与 binaryImages[].name 对齐后按 UUID 查 dSYM 索引。
+    /// - 不写 symbol，交给后台 dSYM 回填；系统库帧在后台找不到索引会自然保持未符号化。
+    static func structuredFrames(fromRawAddresses lines: [String],
+                                 binaryImages: [[String: Any]]) -> [[String: Any]] {
+        guard !lines.isEmpty, !binaryImages.isEmpty else { return [] }
+        // 地址按数值排序，配合下面的有序遍历做区间命中。
+        let images = binaryImages.compactMap { image -> (name: String, base: UInt64, end: UInt64)? in
+            guard let name = image["name"] as? String,
+                  let loadText = image["loadAddress"] as? String,
+                  let base = UInt64(loadText.replacingOccurrences(of: "0x", with: ""), radix: 16),
+                  let size = (image["size"] as? NSNumber)?.uint64Value, size > 0 else { return nil }
+            let end = base + size
+            return end > base ? (name, base, end) : nil
+        }.sorted { $0.base < $1.base }
+        guard !images.isEmpty else { return [] }
+
+        var frames: [[String: Any]] = []
+        for token in lines.prefix(TB_MAX_FRAMES) {
+            guard token.hasPrefix("0x"),
+                  let address = UInt64(token.dropFirst(2), radix: 16) else { continue }
+            // 找覆盖该地址的镜像：loadAddress <= address < loadAddress+size。
+            // size 取的是 __TEXT vmsize，个别帧落在 text 段外时退化为「最近的前一个镜像」。
+            var match: (name: String, base: UInt64, end: UInt64)?
+            for image in images {
+                if image.base <= address && address < image.end {
+                    match = image
+                    break
+                }
+                if image.base > address { break }
+                match = image
+            }
+            frames.append([
+                "module": match?.name ?? "unknown",
+                "address": String(format: "0x%llx", address),
+            ])
+        }
+        return frames
+    }
+
+    private static let TB_MAX_FRAMES = 96
 }
