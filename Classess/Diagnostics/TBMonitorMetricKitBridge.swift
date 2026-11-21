@@ -56,10 +56,18 @@ final class TDMetricKitBridge: NSObject, MXMetricManagerSubscriber {
 
             for hang in payload.hangDiagnostics ?? [] {
                 let ms = hang.hangDuration.converted(to: .milliseconds).value
+                // hang 的 callStackTree 是系统采的权威卡顿栈（系统帧已带 UUID/offset）。
+                // 之前这里只上报了时长、把栈丢了——和同函数里 crash(:44)/cpuException(:72)
+                // 都取 stackString 的做法不一致，等于系统把最有价值的数据送到手边却扔掉。
+                // stack 是 anrEventSchema 的顶层白名单字段，放 fields 不会被服务端剥掉；
+                // 服务端 buildCrashFrames 见 '{' 开头会走 parseMetricKitStack + dSYM 回填。
                 sink.enqueue(TDEvent(
                     kind: "anr",
-                    fields: ["durationMs": ms, "type": "watchdog"],
-                    attributes: ["source": "metrickit", "applicationVersion": hang.applicationVersion]
+                    fields: ["durationMs": ms, "type": "watchdog",
+                             "stack": Self.stackString(hang.callStackTree)],
+                    attributes: ["source": "metrickit",
+                                 "applicationVersion": hang.applicationVersion,
+                                 "symbolicated": false]
                 ))
             }
 

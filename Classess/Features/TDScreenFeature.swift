@@ -35,7 +35,11 @@ final class TDScreenFeature: TDMonitorFeature {
         // 同样有数据，而不是「不走就永远没数据」。
         TDScreenFrameTracker.shared.configure(sliceSeconds: sliceSeconds) { report in
             guard Self.shouldSample(runtime.configuration.sampleRate) else { return }
-            Self.report(report, sink: runtime.sink)
+            // 结算回调在 displayLink（主线程）。按慢帧时刻回查环形缓冲 + dladdr
+            // 符号化都不便宜，整段投到后台队列，绝不在帧回调里做重活。
+            TDMonitorQueues.hang.async {
+                Self.report(report, sink: runtime.sink)
+            }
         }
         return true
     }
@@ -50,6 +54,37 @@ final class TDScreenFeature: TDMonitorFeature {
     }
 
     private static func report(_ report: TDScreenRenderReport, sink: TDEventSink) {
+        var attributes: [String: Any] = [
+            "screen": report.screen,
+            // 自动采集的原始 VC 类名，恒定不变。语义名写错时可据此回溯定位。
+            "screenClass": report.screenClass,
+            // slice = 页面还在，按窗口切的一片；final = 页面已消失
+            "phase": report.phase,
+            // 慢帧率：超过当前设备一帧预算 1.5 倍的帧占比
+            "slowFrameRate": report.slowFrameRate,
+            // 冻结帧率：单帧超过 700ms 的占比，用户能明确感知界面冻住
+            "frozenFrameRate": report.frozenFrameRate,
+            // 卡顿时长占比，对偶发长卡比帧占比更敏感
+            "hitchRatio": report.hitchRatio,
+            "hitchMs": report.hitchMs,
+            "frameCount": report.frameCount,
+            "slowFrames": report.slowFrames,
+            "frozenFrames": report.frozenFrames,
+            // 帧预算随设备刷新率变化，跨设备对比时必须带上这个维度
+            "budgetMs": (report.frameBudget * 1000 * 100).rounded() / 100,
+            "refreshRateHz": Int((1 / max(report.frameBudget, 1.0 / 240.0)).rounded()),
+        ]
+        // 慢帧根因：按最慢那一帧的时刻回查旁路采样器。窗口内没慢帧、或采样器
+        // 当时没运行（无页面/后台）时返回 nil——没有证据就不写，绝不编造空栈。
+        if let moment = report.slowFrameMoment, TDMainThreadSampler.shared.isRunning {
+            if let frames = TDMainThreadSampler.shared.bestFrames(from: moment - 0.05, to: moment + 0.05) {
+                attributes["frames"] = frames
+                attributes["appUUID"] = TDBinaryImage.mainUUID
+                if let loadAddress = TDBinaryImage.mainLoadAddress {
+                    attributes["appLoadAddress"] = String(format: "0x%llx", loadAddress)
+                }
+            }
+        }
         sink.enqueue(TDEvent(
             kind: "mobile_metric",
             fields: [
@@ -57,26 +92,7 @@ final class TDScreenFeature: TDMonitorFeature {
                 "durationMs": report.durationMs,
                 "screen": report.screen,
             ],
-            attributes: [
-                "screen": report.screen,
-                // 自动采集的原始 VC 类名，恒定不变。语义名写错时可据此回溯定位。
-                "screenClass": report.screenClass,
-                // slice = 页面还在，按窗口切的一片；final = 页面已消失
-                "phase": report.phase,
-                // 慢帧率：超过当前设备一帧预算 1.5 倍的帧占比
-                "slowFrameRate": report.slowFrameRate,
-                // 冻结帧率：单帧超过 700ms 的占比，用户能明确感知界面冻住
-                "frozenFrameRate": report.frozenFrameRate,
-                // 卡顿时长占比，对偶发长卡比帧占比更敏感
-                "hitchRatio": report.hitchRatio,
-                "hitchMs": report.hitchMs,
-                "frameCount": report.frameCount,
-                "slowFrames": report.slowFrames,
-                "frozenFrames": report.frozenFrames,
-                // 帧预算随设备刷新率变化，跨设备对比时必须带上这个维度
-                "budgetMs": (report.frameBudget * 1000 * 100).rounded() / 100,
-                "refreshRateHz": Int((1 / max(report.frameBudget, 1.0 / 240.0)).rounded()),
-            ]
+            attributes: attributes
         ))
     }
 }

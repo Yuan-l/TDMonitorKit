@@ -281,6 +281,17 @@ final class TDCrashBridge {
         if let framesDuring = framesDuring { attributes["framesDuring"] = framesDuring }
         if let foreground = foreground { attributes["foreground"] = foreground }
         if let frames = frames, !frames.isEmpty { attributes["frames"] = frames }
+        // 符号化契约：服务端 buildCrashFrames 对 anr 优先用上面的 attributes.frames，
+        // 但 dSYM 回填必须靠 appUUID 选对符号表、appLoadAddress 把绝对地址换算成
+        // 镜像内偏移。缺这两个字段时引擎静默跳过，帧就停在 `$s8...` / `<redacted>`。
+        // 与 recordCrash(:189-193) 同一套取值；anr 是实时上报、无补发场景，
+        // 当前进程的 dyld 基址即卡顿现场基址，可直接用。
+        if attributes["appUUID"] == nil, let uuid = TDBinaryImage.mainUUID {
+            attributes["appUUID"] = uuid
+        }
+        if attributes["appLoadAddress"] == nil, let loadAddress = TDBinaryImage.mainLoadAddress {
+            attributes["appLoadAddress"] = String(format: "0x%llx", loadAddress)
+        }
         let trail = snapshotBreadcrumbs()
         if !trail.isEmpty { attributes["breadcrumbs"] = trail }
         sink.enqueue(TDEvent(kind: "anr", fields: fields, attributes: attributes))
@@ -399,9 +410,18 @@ final class TDCrashBridge {
         ))
     }
 
-    func recordLongTask(durationMs: Double, screen: String?) {
+    func recordLongTask(durationMs: Double, screen: String?, frames: [[String: Any]]? = nil) {
         var attributes: [String: Any] = [:]
         if let screen = screen { attributes["screen"] = screen }
+        // 补主线程栈：服务端 buildCrashFrames 只认 attributes.frames（顶层 frames 会被 zod 剥）。
+        // 带上符号化契约三件套，dSYM 回填才有依据；无栈时不写这些键，避免空壳字段污染。
+        if let frames = frames, !frames.isEmpty {
+            attributes["frames"] = frames
+            attributes["appUUID"] = TDBinaryImage.mainUUID
+            if let loadAddress = TDBinaryImage.mainLoadAddress {
+                attributes["appLoadAddress"] = String(format: "0x%llx", loadAddress)
+            }
+        }
         sink.enqueue(TDEvent(
             kind: "mobile_metric",
             fields: ["name": "long_task", "durationMs": durationMs, "screen": screen ?? ""],

@@ -101,6 +101,9 @@ struct TDScreenRenderReport {
     let frameBudget: CFTimeInterval
     /// `slice` 表示页面还在，按窗口切出来的一片；`final` 表示页面已经消失。
     let phase: String
+    /// 本窗口最慢一帧的时刻（墙钟，与旁路采样器同源）。nil 表示窗口内没有慢帧。
+    /// 只在结算时据此回查「那一帧主线程在做什么」，避免每帧采栈。
+    let slowFrameMoment: CFTimeInterval?
 
     var slowFrameRate: Double {
         frameCount > 0 ? Double(slowFrames) / Double(frameCount) * 100 : 0
@@ -172,6 +175,10 @@ final class TDScreenFrameSession {
     private(set) var frozenFrames = 0
     private(set) var hitchMs: Double = 0
     private var lastTimestamp: CFTimeInterval = 0
+    /// 窗口内 hitch 最大的一帧的时刻与间隔。只存一个：一个 30s 窗口最多带一组栈，
+    /// 既定位到最严重的那帧，又不至于让每帧回查污染性能。
+    private var worstFrameAt: CFTimeInterval = 0
+    private var worstDelta: CFTimeInterval = 0
 
     /// 一帧间隔超过该值视为「非渲染原因」，整段丢弃。
     /// 典型来源：App 切前后台导致 displayLink 暂停后恢复、系统弹窗、来电。
@@ -239,11 +246,18 @@ final class TDScreenFrameSession {
         // 慢帧与冻结帧互斥计数：冻结帧单独成档，未冻结的才进慢帧。
         // 这样 slowFrameRate + frozenFrameRate 才是「全部异常帧占比」。
         guard delta > Self.slowFrameThreshold(expected: expected) else { return }
-        hitchMs += max(0, delta - expected) * 1000
+        let hitch = delta - expected
+        hitchMs += max(0, hitch) * 1000
         if delta > Self.frozenFrameThreshold {
             frozenFrames += 1
         } else {
             slowFrames += 1
+        }
+        // 记下本窗口 hitch 最大的一帧的墙钟时刻（采样器样本用墙钟，必须同源）。
+        // 这里只做两次浮点比较，不采栈、不 dladdr，displayLink 热路径开销可忽略。
+        if hitch > worstDelta {
+            worstDelta = hitch
+            worstFrameAt = CFAbsoluteTimeGetCurrent()
         }
     }
 
@@ -255,11 +269,14 @@ final class TDScreenFrameSession {
 
     /// 结算当前窗口并重置。返回 nil 表示本窗口样本不足，直接丢弃。
     func takeReport(phase: String) -> TDScreenRenderReport? {
+        let moment = worstDelta > 0 ? worstFrameAt : nil
         defer {
             frameCount = 0
             slowFrames = 0
             frozenFrames = 0
             hitchMs = 0
+            worstFrameAt = 0
+            worstDelta = 0
             windowStartedAt = clock.monotonic
         }
         guard isWindowMeaningful else { return nil }
@@ -272,7 +289,8 @@ final class TDScreenFrameSession {
             frozenFrames: frozenFrames,
             hitchMs: hitchMs,
             frameBudget: frameBudget,
-            phase: phase
+            phase: phase,
+            slowFrameMoment: moment
         )
     }
 }
@@ -306,6 +324,7 @@ final class TDScreenFrameTracker {
         handler = nil
         lock.unlock()
         TDDisplayLinkHub.shared.remove(self)
+        TDMainThreadSampler.shared.stop()
     }
 
     func begin(_ session: TDScreenFrameSession) {
@@ -318,6 +337,9 @@ final class TDScreenFrameTracker {
             TDDisplayLinkHub.shared.add(self) { [weak self] timestamp, expected in
                 self?.tick(timestamp: timestamp, expected: expected)
             }
+            // 有页面在屏上才启动旁路栈采样：慢帧/长任务事后要按时刻取「卡住时主线程在做什么」。
+            // 无页面（含后台）时停掉，既省 +3% CPU，也避免后台挂起被误采成卡顿证据。
+            TDMainThreadSampler.shared.start()
         }
     }
 
@@ -336,7 +358,10 @@ final class TDScreenFrameTracker {
         let handler = self.handler
         lock.unlock()
 
-        if nowEmpty { TDDisplayLinkHub.shared.remove(self) }
+        if nowEmpty {
+            TDDisplayLinkHub.shared.remove(self)
+            TDMainThreadSampler.shared.stop()
+        }
         resolveSemantic(for: session)
         if let report = session.takeReport(phase: "final") { handler?(report) }
         // 页面实例已消失，清掉它的语义名，避免 ObjectIdentifier 被新实例复用后读到旧值。

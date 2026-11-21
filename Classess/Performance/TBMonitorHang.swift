@@ -219,12 +219,22 @@ final class TDHangWatchdog {
 /// 卡顿源头：掉帧只是结果，长任务才是原因，且不依赖屏幕刷新。
 final class TDLongTaskMonitor {
 
+    /// 一次长任务：时长、页面、忙窗口起止（墙钟，与旁路采样器同源）。
+    /// 回调仍在主线程（RunLoop observer），所以这里只带轻量值；栈的查询与符号化
+    /// 由调用方转投后台队列，绝不在 observer 回调里做 dladdr / thread_suspend。
+    struct LongTask {
+        let durationMs: Double
+        let screen: String?
+        let busyFrom: CFTimeInterval
+        let busyTo: CFTimeInterval
+    }
+
     private let thresholdMs: Double
-    private let onLongTask: (Double, String?) -> Void
+    private let onLongTask: (LongTask) -> Void
     private var observer: CFRunLoopObserver?
     private var busySince: CFTimeInterval?
 
-    init(thresholdMs: Double, onLongTask: @escaping (Double, String?) -> Void) {
+    init(thresholdMs: Double, onLongTask: @escaping (LongTask) -> Void) {
         self.thresholdMs = max(16, thresholdMs)
         self.onLongTask = onLongTask
     }
@@ -258,7 +268,10 @@ final class TDLongTaskMonitor {
             busySince = nil
             let durationMs = (now - start) * 1000
             guard durationMs >= thresholdMs else { return }
-            onLongTask(durationMs, TDScreenContext.shared.current)
+            // start/now 都是 CFAbsoluteTimeGetCurrent，和 TDMainThreadSampler 的样本时间戳同源。
+            onLongTask(LongTask(durationMs: durationMs,
+                                screen: TDScreenContext.shared.current,
+                                busyFrom: start, busyTo: now))
         default:
             break
         }
