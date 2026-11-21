@@ -104,6 +104,10 @@ struct TDScreenRenderReport {
     /// 本窗口最慢一帧的时刻（墙钟，与旁路采样器同源）。nil 表示窗口内没有慢帧。
     /// 只在结算时据此回查「那一帧主线程在做什么」，避免每帧采栈。
     let slowFrameMoment: CFTimeInterval?
+    /// 结算瞬间从环形缓冲冻结的最慢帧主线程栈**裸地址**。
+    /// 在主线程同步取（纯数组筛选/计数，不调 dladdr），避免异步块执行时缓冲被覆盖；
+    /// 符号化交给后台队列。nil 表示窗口内没慢帧、或那一刻采样器没在跑。
+    let slowFrameAddresses: [UInt64]?
 
     var slowFrameRate: Double {
         frameCount > 0 ? Double(slowFrames) / Double(frameCount) * 100 : 0
@@ -270,6 +274,17 @@ final class TDScreenFrameSession {
     /// 结算当前窗口并重置。返回 nil 表示本窗口样本不足，直接丢弃。
     func takeReport(phase: String) -> TDScreenRenderReport? {
         let moment = worstDelta > 0 ? worstFrameAt : nil
+        // 采样器此刻可能已被 stop（final 路径），但 stop 不再清缓冲，故仍可按时刻回查。
+        // 关键：在主线程结算的这一瞬同步冻结裸地址（纯内存读 + 分组计数，无 dladdr），
+        // 避免异步块执行时缓冲被下一轮覆盖；符号化留到后台队列做。
+        var frozenAddresses: [UInt64]?
+        if worstDelta > 0 {
+            let span = worstDelta
+            frozenAddresses = TDMainThreadSampler.shared.bestAddresses(
+                from: worstFrameAt - span - 0.05,
+                to: worstFrameAt + 0.05
+            )
+        }
         defer {
             frameCount = 0
             slowFrames = 0
@@ -290,7 +305,8 @@ final class TDScreenFrameSession {
             hitchMs: hitchMs,
             frameBudget: frameBudget,
             phase: phase,
-            slowFrameMoment: moment
+            slowFrameMoment: moment,
+            slowFrameAddresses: frozenAddresses
         )
     }
 }

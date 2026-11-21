@@ -35,9 +35,10 @@ final class TDScreenFeature: TDMonitorFeature {
         // 同样有数据，而不是「不走就永远没数据」。
         TDScreenFrameTracker.shared.configure(sliceSeconds: sliceSeconds) { report in
             guard Self.shouldSample(runtime.configuration.sampleRate) else { return }
-            // 结算回调在 displayLink（主线程）。按慢帧时刻回查环形缓冲 + dladdr
-            // 符号化都不便宜，整段投到后台队列，绝不在帧回调里做重活。
-            TDMonitorQueues.hang.async {
+            // 结算回调在 displayLink（主线程）。dladdr 符号化 + 事件组装都不便宜，
+            // 整段投到专用并发队列。绝不能投 `hang`——那条串行队列被 ANR watchdog
+            // 的 semaphore 循环长期独占，投进去永远排不上队，事件会静默丢失。
+            TDMonitorQueues.symbolication.async {
                 Self.report(report, sink: runtime.sink)
             }
         }
@@ -74,10 +75,11 @@ final class TDScreenFeature: TDMonitorFeature {
             "budgetMs": (report.frameBudget * 1000 * 100).rounded() / 100,
             "refreshRateHz": Int((1 / max(report.frameBudget, 1.0 / 240.0)).rounded()),
         ]
-        // 慢帧根因：按最慢那一帧的时刻回查旁路采样器。窗口内没慢帧、或采样器
-        // 当时没运行（无页面/后台）时返回 nil——没有证据就不写，绝不编造空栈。
-        if let moment = report.slowFrameMoment, TDMainThreadSampler.shared.isRunning {
-            if let frames = TDMainThreadSampler.shared.bestFrames(from: moment - 0.05, to: moment + 0.05) {
+        // 慢帧根因：裸地址已在主线程结算瞬间从环形缓冲冻结（见 takeReport），
+        // 这里在后台队列做 dladdr 符号化。没有证据就不写，绝不编造空栈。
+        if let addresses = report.slowFrameAddresses {
+            let frames = TDStackSampler.structured(TDStackSampler.symbolicate(addresses))
+            if !frames.isEmpty {
                 attributes["frames"] = frames
                 attributes["appUUID"] = TDBinaryImage.mainUUID
                 if let loadAddress = TDBinaryImage.mainLoadAddress {

@@ -325,7 +325,17 @@ enum TDMonitorQueues {
     /// 终止现场的落盘（内存序列、前台状态、退出标记）
     static let appState = DispatchQueue(label: "com.truedepth.monitor.appstate", qos: .utility)
     /// 卡顿检测与栈采样
+    ///
+    /// 注意：这是**串行**队列，且 `TDHangWatchdog.loop()` 用 semaphore 长期占住它。
+    /// 任何需要排队执行的后处理（screen_render / long_task 的栈符号化）都**不能**
+    /// 投到这里，否则永远排不上队、事件静默丢失。那些请走 `symbolication`。
     static let hang = DispatchQueue(label: "com.truedepth.monitor.hang", qos: .utility)
+    /// 栈符号化后处理（screen_render / long_task 的 dladdr + 事件组装）。
+    ///
+    /// 独立于 hang 队列：hang 被 watchdog 独占，投进去会饿死。用并发队列，
+    /// 多页面同时结算也不互相阻塞；dladdr 内部自带锁、并发安全。
+    static let symbolication = DispatchQueue(label: "com.truedepth.monitor.symbolication",
+                                             qos: .utility, attributes: .concurrent)
     /// 周期资源采样
     static let resource = DispatchQueue(label: "com.truedepth.monitor.resource", qos: .utility)
 }

@@ -40,7 +40,13 @@ final class TDMainThreadSampler {
     private let intervalMs: Double
     private let capacity: Int
 
-    init(intervalMs: Double = 50, capacity: Int = 24) {
+    /// 默认容量覆盖一整个 slice 窗口（默认 30s）+ 余量。
+    ///
+    /// 为什么不是 24（1.2s）：慢帧的栈在 tick 当下就存在于缓冲里，但结算发生在
+    /// 30s 后的窗口切片——若只留 1.2s，回查时那一刻的样本早被淘汰，永远取不到。
+    /// 640 × 50ms = 32s，够覆盖一个窗口。单样本最多 48 帧 × 8B ≈ 384B，
+    /// 640 个约 240KB，常驻可接受（采样器是全局单例，不随页面数增长）。
+    init(intervalMs: Double = 50, capacity: Int = 640) {
         self.intervalMs = max(20, intervalMs)
         self.capacity = max(4, capacity)
     }
@@ -52,6 +58,8 @@ final class TDMainThreadSampler {
         lock.lock()
         guard timer == nil else { lock.unlock(); return }
         isRunning = true
+        // 新一轮会话从空缓冲开始，避免混入上一次会话（可能已隔很久）的旧样本。
+        buffer.removeAll()
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(Int(intervalMs)))
         timer.setEventHandler { [weak self] in
@@ -78,23 +86,26 @@ final class TDMainThreadSampler {
         guard let timer = timer else { lock.unlock(); return }
         self.timer = nil
         self.isRunning = false
-        self.buffer.removeAll()
+        // 不清 buffer：`end()` 会先 stop 再 takeReport(final)，清了就永远采不到
+        // 页面退出那一刻的栈。缓冲靠 capacity 自然淘汰，start() 时再重置。
         lock.unlock()
         timer.cancel()
     }
 
-    /// 取 [from, to] 窗口内的「最热栈」结构化帧。
+    /// 取 [from, to] 窗口内「最热栈」的裸地址。
     ///
     /// Matrix 算法：栈顶（PC）相同视为同一段卡顿，出现次数近似其耗时，
     /// 并列时取最近一次（栈更完整）。返回 nil 表示窗口内没有样本。
-    /// 符号化在调用方队列（非主线程）执行，dladdr 安全。
-    func bestFrames(from: CFTimeInterval, to: CFTimeInterval) -> [[String: Any]]? {
+    ///
+    /// 这里**只做数组筛选 + 计数**，不调 dladdr——所以可在 displayLink 结算的
+    /// 主线程同步调用，把那一刻的栈冻结下来，避免异步回查时缓冲被覆盖。
+    /// 符号化交给调用方在后台队列做（见 `bestFrames` / `TDScreenFeature.report`）。
+    func bestAddresses(from: CFTimeInterval, to: CFTimeInterval) -> [UInt64]? {
         lock.lock()
         let window = buffer.filter { $0.at >= from && $0.at <= to }
         lock.unlock()
         guard !window.isEmpty else { return nil }
 
-        // 按栈顶地址分组，统计次数并记录各组最近的样本。
         var groups: [UInt64: (count: Int, latest: Sample)] = [:]
         for sample in window {
             guard let top = sample.addresses.first else { continue }
@@ -105,13 +116,17 @@ final class TDMainThreadSampler {
                 groups[top] = (1, sample)
             }
         }
-        // 次数最多优先；并列取时间戳最大（最近）。
         guard let best = groups.max(by: { lhs, rhs in
             if lhs.value.count != rhs.value.count { return lhs.value.count < rhs.value.count }
             return lhs.value.latest.at < rhs.value.latest.at
         }) else { return nil }
+        return best.value.latest.addresses
+    }
 
-        let frames = TDStackSampler.structured(TDStackSampler.symbolicate(best.value.latest.addresses))
+    /// 取窗口内最热栈并符号化为结构化帧。供 long_task 在后台队列一条龙使用。
+    func bestFrames(from: CFTimeInterval, to: CFTimeInterval) -> [[String: Any]]? {
+        guard let addresses = bestAddresses(from: from, to: to) else { return nil }
+        let frames = TDStackSampler.structured(TDStackSampler.symbolicate(addresses))
         return frames.isEmpty ? nil : frames
     }
 }
