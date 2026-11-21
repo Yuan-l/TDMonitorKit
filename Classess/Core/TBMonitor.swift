@@ -327,6 +327,11 @@ public final class TDMonitor {
     /// `TDScreenContext` 还会同步写 `TDAppStateTracker`，让终止归因 `prevScreen`
     /// 与 OOM 页面时间线拿到同一个名字（真机侧是靠 `app_state.json` 落盘的）。
     public func setScreen(_ screen: String?) { TDScreenContext.shared.update(screen) }
+    /// 设置业务页面名并绑定到具体页面实例。渲染会话结算时按同一实例身份取名字，
+    /// 因此切分区 / 多 tab 下各会话互不串味。业务方传 self 即可。
+    public func setScreen(_ screen: String?, page: AnyObject) {
+        TDScreenContext.shared.update(screen, page: page)
+    }
 
     /// 建一个**已经挂好采集器**的统一网络出口。
     ///

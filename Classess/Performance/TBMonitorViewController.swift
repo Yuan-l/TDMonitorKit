@@ -134,7 +134,8 @@ extension UIViewController {
             TDScreenFrameTracker.shared.end(existing)
         }
         let budget = 1.0 / max(Double(UIScreen.main.maximumFramesPerSecond), 60.0)
-        let session = TDScreenFrameSession(screen: name, budget: budget)
+        // 用当前 VC 实例身份建会话，语义名按同一身份绑定（业务 setScreen 传 self）。
+        let session = TDScreenFrameSession(screen: name, pageID: ObjectIdentifier(self), budget: budget)
         objc_setAssociatedObject(self, &tdFrameSessionKey, session, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         TDScreenFrameTracker.shared.begin(session)
     }
@@ -170,3 +171,4 @@ extension UIViewController {
         return name
     }
 }
+

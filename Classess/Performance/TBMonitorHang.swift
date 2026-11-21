@@ -275,12 +275,33 @@ final class TDScreenContext {
     private var stack: [String] = []
     /// 手动 `setScreen` 覆盖值，非 nil 时优先于栈顶。
     private var override: String?
+    /// 页面实例身份 → 业务语义名。`setScreen` 传 self，按实例存一份，供渲染会话
+    /// 结算时按自己的身份精确查询。
+    ///
+    /// 为什么不能用类名或「当时栈顶」：金融首页一个 VC 承载 8 个分区、切分区会在
+    /// viewDidAppear 之外异步调 setScreen；若按栈顶类名记，那一刻栈顶可能还是上一个
+    /// 页面（天气首页），于是天气会话结算时查到 finance.stock——真机上出现过这个串味。
+    /// 用页面实例身份后，天气会话只认天气实例的语义名，金融写自己的实例，互不干扰。
+    private var semanticByPage: [ObjectIdentifier: String] = [:]
     /// 最近一次同步给 AppState 的页面，用来去掉重复的落盘。
     private var lastReported: String?
 
     var current: String? {
         lock.lock(); defer { lock.unlock() }
         return override ?? stack.last
+    }
+
+    /// 渲染会话按自己的页面实例身份取语义名。取不到返回 nil，会话回退到自动类名。
+    func semantic(for pageID: ObjectIdentifier) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return semanticByPage[pageID]
+    }
+
+    /// 页面实例消失时清掉它的语义名，避免实例地址被复用后读到旧页面的名字。
+    func clearSemantic(for pageID: ObjectIdentifier) {
+        lock.lock()
+        semanticByPage[pageID] = nil
+        lock.unlock()
     }
 
     func push(_ name: String) {
@@ -303,10 +324,20 @@ final class TDScreenContext {
     }
 
     /// 手动埋点入口（`TDMonitor.setScreen`）。传 nil 回到自动栈顶。
-    func update(_ name: String?) {
+    /// - `page`：调用方 VC 实例。语义名按它的身份存，渲染会话按同一身份取。
+    ///   不传时只更新 `current`（终止归因 / 卡顿用），不参与渲染会话绑定。
+    func update(_ name: String?, page: AnyObject? = nil) {
         lock.lock()
         override = name
         let resolved = override ?? stack.last
+        if let page = page {
+            let pageID = ObjectIdentifier(page)
+            if let name = name {
+                semanticByPage[pageID] = name
+            } else {
+                semanticByPage[pageID] = nil
+            }
+        }
         lock.unlock()
         reportIfChanged(resolved)
     }

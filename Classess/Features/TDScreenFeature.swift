@@ -59,6 +59,8 @@ final class TDScreenFeature: TDMonitorFeature {
             ],
             attributes: [
                 "screen": report.screen,
+                // 自动采集的原始 VC 类名，恒定不变。语义名写错时可据此回溯定位。
+                "screenClass": report.screenClass,
                 // slice = 页面还在，按窗口切的一片；final = 页面已消失
                 "phase": report.phase,
                 // 慢帧率：超过当前设备一帧预算 1.5 倍的帧占比

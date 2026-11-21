@@ -89,7 +89,10 @@ final class TDDisplayLinkHub {
 /// 上报，那么用户一直停在首页就永远没有首页的渲染数据——而首页恰恰是最重要的
 /// 页面。所以停留在同一页超过 `sliceSeconds` 就结算一片，然后重新开窗。
 struct TDScreenRenderReport {
+    /// 上报用的页面名：业务 `setScreen` 注入的语义名优先，未注入时回退到 `screenClass`。
     let screen: String
+    /// 自动采集的 VC 类名，恒定不变。保留这个原始身份，语义名写错时仍可回溯定位。
+    let screenClass: String
     let durationMs: Double
     let frameCount: Int
     let slowFrames: Int
@@ -128,7 +131,37 @@ struct TDScreenRenderReport {
 /// - 另加 hitchTime：异常帧超出预算的时间之和，比"帧数占比"更贴近体感卡顿时长。
 final class TDScreenFrameSession {
 
-    let screen: String
+    /// 自动采集的 VC 类名，恒定不变。渲染会话在 `viewDidAppear` 里创建，
+    /// 早于业务在 `[super viewDidAppear:]` 之后调用的 `setScreen`，因此不能只靠它。
+    let screenClass: String
+
+    /// 页面实例身份（创建会话的 VC 的 ObjectIdentifier）。语义名按它精确绑定，
+    /// 结算时只查自己的身份，不受其它页面 setScreen 影响。
+    let pageID: ObjectIdentifier
+
+    /// 业务 `setScreen` 注入的语义名。非 nil 时 `screen` 用它，否则回退到 `screenClass`。
+    ///
+    /// 为什么按会话持有而不是上报时读全局 `TDScreenContext.current`：
+    /// push 动画期间新旧两个页面会话并存，30s 切片在任意时刻结算，
+    /// 读全局值会让旧页面被记成新页面的名字。语义名必须绑定到具体页面实例
+    /// （业界如 Datadog 把 view name 绑到 view controller 身份上）。
+    private let nameLock = NSLock()
+    private var _semanticScreen: String?
+
+    /// 当前对外上报的页面名。
+    var screen: String {
+        nameLock.lock(); defer { nameLock.unlock() }
+        return _semanticScreen ?? screenClass
+    }
+
+    /// 由 `TDScreenContext` 在业务 `setScreen` 时注入到当前会话。
+    /// 传 nil 表示清除覆盖，回退到自动采集类名。
+    func applySemanticScreen(_ name: String?) {
+        nameLock.lock()
+        _semanticScreen = name
+        nameLock.unlock()
+    }
+
     /// 当前切片窗口的起点（单调时钟）。
     private(set) var windowStartedAt: CFTimeInterval
     /// 本页面的帧预算（秒）。120Hz 设备上约为 1/120。
@@ -172,8 +205,9 @@ final class TDScreenFrameSession {
     /// 依赖时间的判定能被确定性测试，而不是靠 sleep 去撞。
     private let clock: TDClock
 
-    init(screen: String, budget: CFTimeInterval, clock: TDClock = TDSystemClock.shared) {
-        self.screen = screen
+    init(screen: String, pageID: ObjectIdentifier, budget: CFTimeInterval, clock: TDClock = TDSystemClock.shared) {
+        self.screenClass = screen
+        self.pageID = pageID
         self.clock = clock
         self.windowStartedAt = clock.monotonic
         self.frameBudget = budget
@@ -231,6 +265,7 @@ final class TDScreenFrameSession {
         guard isWindowMeaningful else { return nil }
         return TDScreenRenderReport(
             screen: screen,
+            screenClass: screenClass,
             durationMs: windowDurationMs,
             frameCount: frameCount,
             slowFrames: slowFrames,
@@ -286,6 +321,13 @@ final class TDScreenFrameTracker {
         }
     }
 
+    /// 按页面实例身份把语义名同步到会话：结算时用 session 自己的 pageID 去查，
+    /// 而不是记「最后 setScreen 的名字」或类名。多 tab / 切分区 / 同 VC 多实例下，
+    /// 各会话只认自己的实例，不会被别的页面的 setScreen 串味。
+    private func resolveSemantic(for session: TDScreenFrameSession) {
+        session.applySemanticScreen(TDScreenContext.shared.semantic(for: session.pageID))
+    }
+
     /// 页面消失：结算最后一片并停止跟踪。
     func end(_ session: TDScreenFrameSession) {
         lock.lock()
@@ -295,7 +337,10 @@ final class TDScreenFrameTracker {
         lock.unlock()
 
         if nowEmpty { TDDisplayLinkHub.shared.remove(self) }
+        resolveSemantic(for: session)
         if let report = session.takeReport(phase: "final") { handler?(report) }
+        // 页面实例已消失，清掉它的语义名，避免 ObjectIdentifier 被新实例复用后读到旧值。
+        TDScreenContext.shared.clearSemantic(for: session.pageID)
     }
 
     private func tick(timestamp: CFTimeInterval, expected: CFTimeInterval) {
@@ -309,9 +354,11 @@ final class TDScreenFrameTracker {
         for session in active {
             session.tick(timestamp: timestamp, expected: expected)
             // 停留超过一个窗口就切一片上报，保证长停留页面也有数据。
-            if session.windowDurationMs >= sliceMs,
-               let report = session.takeReport(phase: "slice") {
-                slices.append(report)
+            if session.windowDurationMs >= sliceMs {
+                resolveSemantic(for: session)
+                if let report = session.takeReport(phase: "slice") {
+                    slices.append(report)
+                }
             }
         }
         for report in slices { handler?(report) }

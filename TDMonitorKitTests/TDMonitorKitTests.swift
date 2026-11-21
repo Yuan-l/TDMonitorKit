@@ -297,8 +297,11 @@ final class TDScreenFrameSessionTests: TDMonitorKitTestCase {
     private let budget60Hz: CFTimeInterval = 1.0 / 60.0
 
     private func makeSession(clock: TDManualClock = TDManualClock()) -> TDScreenFrameSession {
-        TDScreenFrameSession(screen: "HomeViewController", budget: budget60Hz, clock: clock)
+        TDScreenFrameSession(screen: "HomeViewController", pageID: ObjectIdentifier(Self.testPage), budget: budget60Hz, clock: clock)
     }
+
+    /// 测试用的稳定页面身份。
+    static let testPage = NSObject()
 
     func testCountsSlowFrameWhenIntervalExceedsThreshold() {
         let session = makeSession()
@@ -390,8 +393,8 @@ final class TDScreenFrameSessionTests: TDMonitorKitTestCase {
     /// 120Hz 设备的帧预算不同，同一个 20ms 间隔在 60Hz 上是慢帧、在 120Hz 上更是慢帧。
     /// 这条断言守住「不要写死 16.67ms / 16.95ms」——阈值必须按实测刷新率推导。
     func testSlowFrameJudgementFollowsDeviceBudget() {
-        let sixty = TDScreenFrameSession(screen: "A", budget: 1.0 / 60.0, clock: TDManualClock())
-        let oneTwenty = TDScreenFrameSession(screen: "A", budget: 1.0 / 120.0, clock: TDManualClock())
+        let sixty = TDScreenFrameSession(screen: "A", pageID: ObjectIdentifier(NSObject()), budget: 1.0 / 60.0, clock: TDManualClock())
+        let oneTwenty = TDScreenFrameSession(screen: "A", pageID: ObjectIdentifier(NSObject()), budget: 1.0 / 120.0, clock: TDManualClock())
 
         for session in [sixty, oneTwenty] {
             session.tick(timestamp: 1.000, expected: session.frameBudget)
@@ -412,6 +415,118 @@ final class TDScreenFrameSessionTests: TDMonitorKitTestCase {
         XCTAssertEqual(session.slowFrames, 0)
         XCTAssertEqual(session.frozenFrames, 0)
         XCTAssertEqual(session.hitchMs, 0)
+    }
+
+    // MARK: - 页面语义（一处 setScreen，处处生效）
+
+    /// 未注入语义名时回退到自动采集类名：零接入基线，页面不埋点也有数据。
+    func testScreenFallsBackToClassWhenNoSemantic() {
+        let session = makeSession()
+        XCTAssertEqual(session.screen, "HomeViewController")
+        XCTAssertEqual(session.screenClass, "HomeViewController")
+    }
+
+    /// 业务 setScreen 注入的语义名优先于类名，且类名原样保留可回溯。
+    func testSemanticScreenWinsAndClassIsPreserved() {
+        let clock = TDManualClock()
+        let session = makeSession(clock: clock)
+        session.applySemanticScreen("weather.home")
+
+        var ts: CFTimeInterval = 1.0
+        session.tick(timestamp: ts, expected: budget60Hz)
+        for _ in 0..<11 {
+            ts += 0.016
+            session.tick(timestamp: ts, expected: budget60Hz)
+        }
+        clock.advance(0.4)
+
+        let report = session.takeReport(phase: "final")
+        XCTAssertNotNil(report)
+        XCTAssertEqual(report?.screen, "weather.home")
+        XCTAssertEqual(report?.screenClass, "HomeViewController")
+    }
+
+    /// setScreen(nil) 清除覆盖后回到自动类名，不残留上一次的语义名。
+    func testScreenFallsBackAfterSemanticCleared() {
+        let session = makeSession()
+        session.applySemanticScreen("weather.home")
+        XCTAssertEqual(session.screen, "weather.home")
+
+        session.applySemanticScreen(nil)
+        XCTAssertEqual(session.screen, "HomeViewController")
+    }
+}
+
+/// 页面语义按「页面实例身份」绑定：多 tab / 同 VC 多实例时各会话只查自己的语义名，
+/// 不被别的页面的 setScreen 串味。回归曾经出现的「天气首页会话被写成 finance.stock」。
+final class TDScreenSemanticBindingTests: TDMonitorKitTestCase {
+
+    func testSemanticIsolationBetweenPageInstances() {
+        let context = TDScreenContext()
+        let weatherPage = NSObject()
+        let financePage = NSObject()
+
+        context.update("weather.home", page: weatherPage)
+        // 金融页 setScreen 传自己的实例，不能改掉天气实例的语义名
+        context.update("finance.stock", page: financePage)
+
+        XCTAssertEqual(context.semantic(for: ObjectIdentifier(weatherPage)), "weather.home")
+        XCTAssertEqual(context.semantic(for: ObjectIdentifier(financePage)), "finance.stock")
+        XCTAssertNil(context.semantic(for: ObjectIdentifier(NSObject())))
+    }
+
+    /// 复刻真机串味路径：天气会话已 begin，金融页在 viewDidAppear 之外切分区 setScreen。
+    /// 即便那一刻栈顶还是天气类名，金融的语义名也只能写进金融实例，天气会话取自己的。
+    func testFinanceSwitchSectionDoesNotPolluteWeatherSession() {
+        let context = TDScreenContext()
+        let weatherPage = NSObject()
+        let financePage = NSObject()
+
+        context.push("QWeatherHomeViewController")
+        context.update("weather.home", page: weatherPage)
+        // 金融页异步切分区：setScreen 传金融实例，此时自动栈顶仍是天气类名
+        context.update("finance.stock", page: financePage)
+
+        // 天气会话按自己的 pageID 取，仍是 weather.home，绝不串成 finance.stock
+        XCTAssertEqual(context.semantic(for: ObjectIdentifier(weatherPage)), "weather.home")
+        XCTAssertEqual(context.semantic(for: ObjectIdentifier(financePage)), "finance.stock")
+    }
+
+    /// 同一个 VC 承载多分区（金融首页 8 个品种）：切分区更新只影响该实例，
+    /// 且取到的是最新一次 setScreen 的语义名。
+    func testSemanticByPageUpdatesForSameVC() {
+        let context = TDScreenContext()
+        let financePage = NSObject()
+
+        context.update("finance.stock", page: financePage)
+        XCTAssertEqual(context.semantic(for: ObjectIdentifier(financePage)), "finance.stock")
+
+        context.update("finance.fund", page: financePage)
+        XCTAssertEqual(context.semantic(for: ObjectIdentifier(financePage)), "finance.fund")
+    }
+
+    /// setScreen(nil) 清除该实例的映射，会话回退到自动类名。
+    func testSemanticClearedForPage() {
+        let context = TDScreenContext()
+        let weatherPage = NSObject()
+        let pageID = ObjectIdentifier(weatherPage)
+
+        context.update("weather.home", page: weatherPage)
+        XCTAssertEqual(context.semantic(for: pageID), "weather.home")
+
+        context.update(nil, page: weatherPage)
+        XCTAssertNil(context.semantic(for: pageID))
+    }
+
+    /// 页面消失后清掉映射，避免实例地址被复用后读到旧页面的语义名。
+    func testClearSemanticOnPageEnd() {
+        let context = TDScreenContext()
+        let page = NSObject()
+        let pageID = ObjectIdentifier(page)
+
+        context.update("weather.home", page: page)
+        context.clearSemantic(for: pageID)
+        XCTAssertNil(context.semantic(for: pageID))
     }
 }
 
