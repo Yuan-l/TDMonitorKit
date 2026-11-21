@@ -58,11 +58,15 @@ enum TDStackSampler {
             addresses.append(UInt64(state.__lr) & addressMask)
         }
 
-        // 帧记录布局（AAPCS64）：[fp] = 上一帧的 fp，[fp + 8] = 返回地址。
+        // 帧记录布局（AAPCS64）：[fp] = 调用者的 fp，[fp + 8] = 返回地址。
+        // 栈向低地址增长，所以沿 fp 链往调用者回溯时 fp **递增**（被调者 fp < 调用者 fp）。
+        // 这里必须要求 framePointer > previous 且 previous 从 0 起：若写成
+        // `framePointer < previous` + previous=UInt64.max，只有第一轮能通过，
+        // 第二轮起 fp 递增便永远不满足条件，栈恒定只剩 1~2 帧——曾导致卡顿栈无法定位。
         var framePointer = UInt64(state.__fp) & addressMask
-        var previous = UInt64.max
+        var previous: UInt64 = 0
         for _ in 0..<maxFrames {
-            guard framePointer != 0, framePointer % 8 == 0, framePointer < previous else { break }
+            guard framePointer != 0, framePointer % 8 == 0, framePointer > previous else { break }
             guard let record = readMemory(at: framePointer, count: 16) else { break }
             let next = record.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt64.self) } & addressMask
             let returnAddress = record.withUnsafeBytes { $0.load(fromByteOffset: 8, as: UInt64.self) } & addressMask
