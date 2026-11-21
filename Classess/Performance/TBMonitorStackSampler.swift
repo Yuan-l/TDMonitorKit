@@ -77,6 +77,14 @@ enum TDStackSampler {
     static func captureMainThreadAddresses(maxFrames: Int = 48) -> [UInt64] { [] }
     #endif
 
+    /// 单个 Mach-O image（含 dyld shared cache 内的系统库）的合理大小上限。
+    ///
+    /// 帧指针链回溯时 `[fp + 8]` 偶尔读到失效的返回地址（PAC 签名残留或栈上垃圾），
+    /// 例如真机实测的 `0x2b8228bc4fd8`（48TB 级伪地址）。`dladdr` 对这类越界地址
+    /// 仍会返回「最近的 image」并算成功，进而得出 TB 级 offset。真实 image 绝不可能
+    /// 超过 1GB，超过即判为坏帧丢弃，避免污染栈顶签名与服务端 dSYM 回填。
+    private static let maxReasonableImageSize: UInt64 = 0x4000_0000  // 1GB
+
     /// 地址 → 模块 / 符号。只在线程恢复之后调用。
     static func symbolicate(_ addresses: [UInt64]) -> [Frame] {
         #if canImport(Darwin)
@@ -89,13 +97,16 @@ enum TDStackSampler {
                 frames.append(Frame(module: "unknown", symbol: nil, address: address, offsetInImage: 0))
                 continue
             }
-            let module = info.dli_fname.map { URL(fileURLWithPath: String(cString: $0)).lastPathComponent } ?? "unknown"
             let base = UInt64(UInt(bitPattern: info.dli_fbase))
+            let offset = address >= base ? address - base : 0
+            // 坏帧（失效返回地址）算出的 offset 会远超任何真实 image 的大小。
+            guard offset <= Self.maxReasonableImageSize else { continue }
+            let module = info.dli_fname.map { URL(fileURLWithPath: String(cString: $0)).lastPathComponent } ?? "unknown"
             let symbol = info.dli_sname.map { String(cString: $0) }
             frames.append(Frame(module: module,
                                 symbol: symbol,
                                 address: address,
-                                offsetInImage: address >= base ? address - base : 0))
+                                offsetInImage: offset))
         }
         return frames
         #else
