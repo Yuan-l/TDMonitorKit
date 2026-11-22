@@ -219,7 +219,18 @@
 - **镜像 UUID `TDBinaryImage`**：直接从 Mach-O `LC_UUID` 读，不依赖私有接口；上报 `appUUID` + `appLoadAddress`（PIE 每次 slide 不同，没有基址事后无法 atos 还原行号）。
 - **把宿主缺口变指标**：每次启动检查"上次异常退出 && 无崩溃文件 → `crash_pipeline_missing`"——缺口有数字，不是静默。
 
-**符号化链路的真实状态（2026-11-22 查库校正，勿夸大）**：客户端 `attributes.frames` 与 MetricKit 原始 `stack`（UUID+offset 的 JSON）都**带齐了符号化前提**，后台 `crash-symbolicator.ts` 也实现了按地址区间定位镜像 + dSYM 索引回填，代码链路是通的。但**完整还原业务帧依赖对应构建的 dSYM 已上传**：当前 `symbol_indexes` 表只有 2 个 UUID（`LMPerformanceKit`、`TrueDepthDemo2.debug.dylib`，11-20 上传），而真机崩溃的 `appUUID`（`367CF844…`/`F3DF4371…`）从未上传过符号表。因此端到端 API 实测：系统库帧可读（dladdr/demangle 得来），**业务帧只有 demangle 出的 mangled 名、`symbolSource=raw/demangle`、`frameKind=unknown`，没有一条是 `dsym` 回填**。此前"崩溃符号化闭合、75 帧完整可读"是挑了最好的一条下的结论——真实情况是一部分帧可读、业务帧未做 dSYM 还原。要让业务帧可读，需为当前 Release 构建执行 `scripts/upload-dsym.mjs` 上传 dSYM 后复验。
+**符号化链路的真实状态（2026-11-22 查库校正，勿夸大）**：客户端 `attributes.frames` 与 MetricKit 原始 `stack`（UUID+offset 的 JSON）都**带齐了符号化前提**，后台 `crash-symbolicator.ts` 也实现了按地址区间定位镜像 + dSYM 索引回填，代码链路是通的。但**完整还原业务帧依赖对应构建的 dSYM 已上传**：当前 `symbol_indexes` 表只有 2 个 UUID（`LMPerformanceKit`、`TrueDepthDemo2.debug.dylib`，11-20 上传），而真机崩溃的 `appUUID`（`367CF844…`/`F3DF4371…`）从未上传过符号表。因此端到端 API 实测：系统库帧可读（dladdr/demangle 得来），**业务帧只有 demangle 出的 mangled 名、`symbolSource=raw/demangle`、`frameKind=unknown`，没有一条是 `dsym` 回填**。此前"崩溃符号化闭合、75 帧完整可读"是挑了最好的一条下的结论——真实情况是一部分帧可读、业务帧未做 dSYM 还原。
+
+**为什么没继续上传 dSYM 去补（2026-11-22 深挖结论）**：符号表按 `LC_UUID` 精确匹配，而每次编译 UUID 都变。逐项对照发现本地**没有**任何与真机事件匹配的 dSYM：
+
+| 来源 | TrueDepthDemo2.debug.dylib 的 UUID |
+|---|---|
+| 历史崩溃现场（11-20，`367CF844` 那批） | `45087446…` |
+| 本地 `.build` DerivedData 的 dSYM | `BAC48AA8…` |
+| 本地 Xcode 默认 DerivedData 的 dSYM | `8808CFBF…` |
+| 后台已上传的符号索引（11-20） | `ED303387…` |
+
+四个 UUID 互不相同——产生那批崩溃的构建 dSYM 早已被后续编译覆盖丢失。此时把不匹配的 dSYM 传上去，后台二分查表只会算出**错误的函数名**（地址落在别的函数区间），属于用假数据冒充"已符号化"，正是数据正确性红线禁止的。正确做法只有两条：① 发版/CI 时把当次构建的 dSYM 随产物归档并按 UUID 上传（工程化缺的一环）；② 当前 Debug 包的业务帧本就带 mangled symbol、`symbolSource=demangle` 已可读（如 `$s14TrueDepthDemo2…AppDelegate…$main`），这类帧不需要 dSYM；需要 dSYM 的是被 strip 的 Release 裸地址帧，而那类帧的 dSYM 当前恰好缺失。结论：**端到端符号化链路代码是通的、但缺"构建时归档并上传 dSYM"这一环，业务帧的可读性目前靠 dladdr/demangle 兜底，不是 dSYM**。
 
 ### 业界怎么做的
 
