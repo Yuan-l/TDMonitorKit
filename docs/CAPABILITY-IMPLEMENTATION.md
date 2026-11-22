@@ -73,7 +73,7 @@
 - **不引入新卡顿**：卡顿定义就是主线程已堵死——看门狗正是靠主线程 semaphore 没被 signal 才判定卡顿，挂起一个本不在跑的线程不会让它更卡；`thread_suspend`/`thread_resume` 是微秒级内核调用，采样跑在我们的后台 hang 队列上，不占主线程。
 - **真正的风险是死锁，不是卡顿**：若采样线程在**主线程挂起期间**调用了主线程持有的锁（如 `dladdr` 会碰 `dlopen` 锁），进程会死锁。我们的规避与 Sentry iOS profiler 博客一致——**挂起期间只做必要操作**（`thread_get_state` + 原始帧指针内存读 `vm_read_overwrite`），符号化（`dladdr`）一律放到 `thread_resume` 之后。
 - **多次采样优于单快照**：卡顿期间每 `sampleIntervalMs`（默认 50ms）采一次、取首条 >2 帧的样。Sentry 自承「主线程极忙时 hang 检测会偏晚、栈可能不完全相关」，我们多次采样反而缓解这个。
-- **诚实的残余限制——帧指针回溯不完整**：我们用 AAPCS64 帧指针链回溯。Sentry 官方指出 FP 回溯**只在二进制带帧指针时有效**，叶子函数、尾调用、重度内联可能不产生帧记录，栈因此不完整；业界崩溃报告（KSCrash/Sentry）改用 **compact unwind + DWARF** 才能 100% 还原。我们为「挂起期零锁、可移植」选了 FP 方案，**代价是偶尔漏帧**——已知取舍，非 bug。
+- **帧指针回溯的真实局限（口径已校正）**：我们用 AAPCS64 帧指针链回溯。此前把"栈只有 1–2 帧"写成"FP 方案的已知取舍、非 bug"，**这是误判**：真机复验发现根因是回溯方向写反（`framePointer < previous` + 初值 `UInt64.max`，而栈向低地址增长、沿 fp 往调用者回溯时 fp 递增），独立 C 程序对照证实旧逻辑只回溯 1 帧、修正后 11 帧；改为 `framePointer > previous` + 初值 0 后，真机栈深度从 1–2 帧恢复到平均 6 帧、最深 8 帧。修正后仍存在的**真实**局限是：叶子函数、尾调用、重度内联不产生 fp 记录时链会断，这类帧的补全需要 compact unwind + DWARF（KSCrash/Sentry 的做法），代价更大，本次不做。栈深 6–8 帧已能满足"看出主线程卡在哪"的定位目标。
 
 **原生长任务 `TDLongTaskMonitor`（主线程连续忙）**
 
@@ -218,6 +218,8 @@
 - **面包屑落盘 `TDBreadcrumbStore`**：100 条环形，节流写（>1s 才落盘，期间攒脏标记），进入后台/崩溃前 `flush`。崩溃是下次启动补发的，内存里的轨迹必然丢失，**所以必须落盘上次会话的轨迹**（`loadPreviousSession`），崩溃事件才能带上真实操作链。
 - **镜像 UUID `TDBinaryImage`**：直接从 Mach-O `LC_UUID` 读，不依赖私有接口；上报 `appUUID` + `appLoadAddress`（PIE 每次 slide 不同，没有基址事后无法 atos 还原行号）。
 - **把宿主缺口变指标**：每次启动检查"上次异常退出 && 无崩溃文件 → `crash_pipeline_missing`"——缺口有数字，不是静默。
+
+**符号化链路的真实状态（2026-11-22 查库校正，勿夸大）**：客户端 `attributes.frames` 与 MetricKit 原始 `stack`（UUID+offset 的 JSON）都**带齐了符号化前提**，后台 `crash-symbolicator.ts` 也实现了按地址区间定位镜像 + dSYM 索引回填，代码链路是通的。但**完整还原业务帧依赖对应构建的 dSYM 已上传**：当前 `symbol_indexes` 表只有 2 个 UUID（`LMPerformanceKit`、`TrueDepthDemo2.debug.dylib`，11-20 上传），而真机崩溃的 `appUUID`（`367CF844…`/`F3DF4371…`）从未上传过符号表。因此端到端 API 实测：系统库帧可读（dladdr/demangle 得来），**业务帧只有 demangle 出的 mangled 名、`symbolSource=raw/demangle`、`frameKind=unknown`，没有一条是 `dsym` 回填**。此前"崩溃符号化闭合、75 帧完整可读"是挑了最好的一条下的结论——真实情况是一部分帧可读、业务帧未做 dSYM 还原。要让业务帧可读，需为当前 Release 构建执行 `scripts/upload-dsym.mjs` 上传 dSYM 后复验。
 
 ### 业界怎么做的
 
@@ -373,9 +375,11 @@ Firebase `FPRScreenTraceTracker` 同样 swizzle 生命周期取页面加载耗�
 
 **MetricKit 为什么只能当补充源**：数据由系统在 App 外聚合，用户必须开启「共享 iPhone 分析」才投递；按天批量、无实时性；只有累计计数/直方图，没有业务上下文、面包屑、逐用户现场；栈未符号化。关闭分析的用户**永远没有数据**，且 API 读不到这个开关。
 
-**本项目的真机证据**：这台 iPhone 13 / iOS 18.3 上，每一次 `session_start` 的
-`metrickitPayloads` 都是 **0**，`cap.oom_metrickit=1` 只代表「能力已安装」，不代表「收到过数据」。
-也就是说：把它写成「系统权威源、与启发式并列」是误导，**全量可用的那条是启发式**。
+**本项目的真机证据（口径已校正）**：此前写「每次 `session_start` 的 `metrickitPayloads` 都是 0」是**错的**——
+`metrickitPayloads` 取自 `TDMetricKitCoverage.deliveryCount`，语义是**该设备自安装以来的累计投递次数**，
+不是本次会话增量。真机库实测：130 个会话里 **95 个 >0（最高 14）**，证明 MetricKit 在这台设备上真实投递过。
+当时下"永远是 0"的结论，是拿某一时刻（设备刚装、尚未收到投递）的快照写成普遍规律，属于臆测。
+结论不变的部分仍成立：MetricKit 是补充源而非 OOM 主路径（业界一致），OOM 率的分子取启发式路径。
 
 ### 差异与取舍
 
@@ -418,13 +422,15 @@ Firebase `FPRScreenTraceTracker` 同样 swizzle 生命周期取页面加载耗�
 
 **D 类项的契约约束（改动前必读，避免"推断当结论"）**
 
-1. OOM 五档：每档带 `confidence`，`unknown` 不冒充 OOM，单测锁 `TDTerminationClassifierTests`。
-2. 切片：`phase` 区分、结算即重置不重复，单测锁 `TDScreenSliceTests`。
+1. OOM 五档：每档带 `confidence`，`unknown` 不冒充 OOM，`TDTerminationClassifierTests` 覆盖此契约（**已写、未实跑**，见下方工程化债）。
+2. 切片：`phase` 区分、结算即重置不重复，`TDScreenSliceTests` 覆盖（**已写、未实跑**）。
 3. `0.85` 比值：注释标明非业界口径，拿不到 limit 退化为可用内存阈值。
-4. 运行期服务字典：注册表图谱单测 `TDRegistryGraphTests` 锁内置 12 能力自检自洽。
+4. 运行期服务字典：`TDRegistryGraphTests` 覆盖内置 12 能力自检自洽（**已写、未实跑**）。
+
+> 措辞说明：以上三处此前写"单测锁住"，容易被读成"已验证通过"。事实是测试代码存在，但没有一次成功的实跑记录，不能作为契约已成立的证据。
 
 **仍待补的工程化债（非本次范围）**
 
-- **构建可重现**：SPM `Package.swift` 在干净环境 `swift test` 仍需打通（当前受 Podfile.local 私有注入/沙箱限制）；README 的接入与验证步骤待补齐。
+- **构建可重现**：SPM `Package.swift` 在干净环境 `swift test` 仍需打通；README 的接入与验证步骤待补齐。2026-11-22 实测 `xcrun swift test` 在 manifest 编译阶段即被 `sandbox-exec: sandbox_apply: Operation not permitted` 拦住（本机沙箱限制，非代码问题），需在 Xcode GUI 或 CI 无沙箱环境跑。
 - **能力粒度太粗**：配置只有 `autoCollect`/`networkInstrumentation`/`viewLoadInstrumentation`/`nonFatalCapture` 四个总开关，无法单独关 ANR/调卡顿窗口/开关 OOM 归因。
-- **三份偏离契约单测**（Termination/Slice/RegistryGraph）已在代码层写好，但本环境沙箱拦了 `xcodebuild`，**尚未实跑**——下次在 Xcode/CI 跑一遍确认绿才算真正闭环。
+- **三份偏离契约单测**（Termination/Slice/RegistryGraph）已在代码层写好，但**从未成功实跑**——在 Xcode/CI 跑一遍确认绿之前，只能标"已实现未验证"，不算闭环。
